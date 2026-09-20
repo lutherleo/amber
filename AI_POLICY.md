@@ -69,4 +69,4 @@ Basic development tools (git, gcc, make, editors) should not be listed.
 
 Example:
 
-Assisted-by: Claude:claude-3-opus
+Assisted-by: ExampleAgent:v1.0
