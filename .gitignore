@@ -1,0 +1,58 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local configuration (keep examples, ignore actual)
+.baseline.toml
+project.toml
+!example.*.toml
+!example.*.yaml
+# Test fixtures with tracked .baseline.toml. The top-level rule above
+# would otherwise strip them and CI would either deselect the whole
+# suite (parity) or auto-pick a different framework than the fixture
+# expects (harness).
+!tests/darnit/harness/fixtures/**/.baseline.toml
+!tests/darnit/parity/fixtures/**/.baseline.toml
+
+# Logs
+*.log
+
+# Type checking
+.mypy_cache/
+.pytype/
+
+# Claude Code local settings
+.claude/
+baseline-test-repo/
+.doc-cache/
+
+.darnit/
+
+# Feature 028: Tier 2 parity check writes skill-invocation transcripts here.
+parity-artifacts/

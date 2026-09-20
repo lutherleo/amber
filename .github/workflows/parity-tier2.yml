@@ -1,0 +1,103 @@
+# Feature 028 Tier 2: coding-agent skill vs raw MCP tool output parity.
+#
+# Manual-dispatch only. See contract at
+# specs/028-audit-parity-tests/contracts/tier2-workflow.md
+# and governance rationale at spec.md FR-007 / FR-007a / FR-007b.
+#
+# Key security properties (see contract T2-1..T2-16):
+#   - T2-1: workflow_dispatch is the ONLY trigger. No schedule; no push.
+#   - T2-2: Environment `parity-tier2` is REQUIRED. Configure in GitHub UI
+#           with a reviewer list AND the ANTHROPIC_API_KEY secret at the
+#           Environment level (NOT repo level).
+#   - T2-4: NO other workflow in .github/workflows/ references
+#           secrets.ANTHROPIC_API_KEY. Verified by
+#           tests/darnit/parity/tier2/test_workflow_config.py.
+#   - T2-5: permissions: contents: read only. No write scope granted.
+#   - T2-7/T2-8: Preflight actor+SHA logged BEFORE the SDK step consumes
+#                the API key.
+#   - T2-10: NO api_key workflow input (governance regression guard).
+#   - T2-11: artifact upload runs on any exit code (`if: always()`).
+#
+# Kusari Inspector hardening (2026-08-12):
+#   - Actions pinned to full commit SHAs (mutable version tags would allow
+#     a compromised action owner to silently repoint a tag and execute
+#     arbitrary code in the runner while ANTHROPIC_API_KEY is in env).
+#   - All `${{ ... }}` context expressions in `run:` blocks moved to
+#     step-level `env:` variables and referenced as quoted shell vars.
+#     Prevents shell injection via crafted `fixture_glob` inputs.
+
+name: Parity Tier 2
+
+on:
+  workflow_dispatch:
+    inputs:
+      fixture_glob:
+        description: "Glob to filter which fixtures are run (default: all)"
+        default: "*"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  tier2:
+    runs-on: ubuntu-latest
+    environment: parity-tier2  # T2-2: gated Environment with required reviewers
+    permissions:
+      contents: read  # T2-5: no write scope
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+
+      - name: Sync Tier 2 parity environment
+        # PR #370 review fix: `claude-agent-sdk` no longer ships in the
+        # `[dev]` extra of `darnit-mcp`; it lives in the dedicated
+        # `[parity-tier2]` extra so `pip install darnit-mcp[dev]` on a
+        # regular contributor's machine stays lean. Tier 2 CI opts in
+        # explicitly.
+        run: uv sync --extra dev --extra parity-tier2
+
+      - name: Preflight audit log (T2-7/T2-8)
+        env:
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          FIXTURE_GLOB: ${{ inputs.fixture_glob }}
+        run: |
+          {
+            echo "## Tier 2 Preflight"
+            echo ""
+            echo "- actor: $ACTOR"
+            echo "- sha: $SHA"
+            echo "- fixture_glob: $FIXTURE_GLOB"
+            echo "- timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Tier 2 parity check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIXTURE_GLOB: ${{ inputs.fixture_glob }}
+        run: |
+          # Run as a module (`python -m`) so the `tests.` package imports
+          # inside run.py resolve. Running as a script (`python <path>`)
+          # would fail because the `tests` package wouldn't be on sys.path.
+          # FIXTURE_GLOB is passed via env (not interpolated directly into
+          # this shell block) to prevent shell injection.
+          uv run python -m tests.darnit.parity.tier2.run \
+            --fixture-glob "$FIXTURE_GLOB"
+
+      - name: Upload parity artifacts (T2-11)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: parity-artifacts
+          path: parity-artifacts/
+          retention-days: 30

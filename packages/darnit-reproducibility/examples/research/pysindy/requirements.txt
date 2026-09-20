@@ -1,0 +1,7 @@
+# Downloaded external research package (plus its scientific stack).
+# NOTE: pysindy 2.1.0 requires numpy>=2, so this example uses a numpy-2 stack (unlike the numpy-1.26
+# examples). capture_research.sh installs per-example requirements before each capture, pysindy last.
+pysindy==2.1.0
+numpy==2.5.3
+scipy==1.13.1
+scikit-learn==1.5.1

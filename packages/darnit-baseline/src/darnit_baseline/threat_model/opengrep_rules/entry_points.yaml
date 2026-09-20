@@ -1,0 +1,60 @@
+rules:
+  - id: darnit.entry.fastapi-route
+    languages: [python]
+    severity: INFO
+    message: "FastAPI route: $METHOD $PATH -> $FUNC"
+    patterns:
+      - pattern: |
+          @$APP.$METHOD($PATH, ...)
+          async def $FUNC(...):
+              ...
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: (get|post|put|delete|patch|options|head)
+
+  - id: darnit.entry.fastapi-route-sync
+    languages: [python]
+    severity: INFO
+    message: "FastAPI route (sync): $METHOD $PATH -> $FUNC"
+    patterns:
+      - pattern: |
+          @$APP.$METHOD($PATH, ...)
+          def $FUNC(...):
+              ...
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: (get|post|put|delete|patch|options|head)
+
+  - id: darnit.entry.flask-route
+    languages: [python]
+    severity: INFO
+    message: "Flask route: $PATH -> $FUNC"
+    pattern: |
+      @$APP.route($PATH, ...)
+      def $FUNC(...):
+          ...
+
+  - id: darnit.entry.mcp-tool
+    languages: [python]
+    severity: INFO
+    message: "MCP tool handler: $FUNC"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$SERVER.tool(...)
+              def $FUNC(...):
+                  ...
+          - pattern: |
+              @$SERVER.tool(...)
+              async def $FUNC(...):
+                  ...
+
+  - id: darnit.entry.express-route
+    languages: [javascript, typescript]
+    severity: INFO
+    message: "Express route: $METHOD $PATH"
+    patterns:
+      - pattern: $APP.$METHOD($PATH, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: (get|post|put|delete|patch|use)

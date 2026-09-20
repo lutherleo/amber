@@ -1,0 +1,52 @@
+rules:
+  - id: darnit.datastore.sqlalchemy
+    languages: [python]
+    severity: INFO
+    message: "SQLAlchemy database connection"
+    pattern: create_engine(...)
+
+  - id: darnit.datastore.sqlite
+    languages: [python]
+    severity: INFO
+    message: "SQLite database connection"
+    pattern: sqlite3.connect(...)
+
+  - id: darnit.datastore.psycopg
+    languages: [python]
+    severity: INFO
+    message: "PostgreSQL connection via psycopg"
+    pattern-either:
+      - pattern: psycopg.connect(...)
+      - pattern: psycopg2.connect(...)
+
+  - id: darnit.datastore.asyncpg
+    languages: [python]
+    severity: INFO
+    message: "PostgreSQL connection via asyncpg"
+    pattern-either:
+      - pattern: asyncpg.connect(...)
+      - pattern: asyncpg.create_pool(...)
+
+  - id: darnit.datastore.redis-python
+    languages: [python]
+    severity: INFO
+    message: "Redis connection"
+    pattern-either:
+      - pattern: redis.Redis(...)
+      - pattern: redis.StrictRedis(...)
+      - pattern: Redis(...)
+      - pattern: StrictRedis(...)
+
+  - id: darnit.datastore.pymongo
+    languages: [python]
+    severity: INFO
+    message: "MongoDB connection"
+    pattern-either:
+      - pattern: pymongo.MongoClient(...)
+      - pattern: MongoClient(...)
+
+  - id: darnit.datastore.go-sql-open
+    languages: [go]
+    severity: INFO
+    message: "SQL database connection"
+    pattern: sql.Open($DRIVER, ...)

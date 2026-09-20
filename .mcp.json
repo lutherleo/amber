@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "openssf-baseline": {
+      "command": "uv",
+      "args": ["run", "darnit", "serve", "--framework", "openssf-baseline"]
+    }
+  }
+}

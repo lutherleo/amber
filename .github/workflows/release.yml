@@ -1,0 +1,547 @@
+name: Release
+
+# Tag-driven release. See specs/012-packaging-distribution/ for the original
+# spec; this workflow ships the first-cut subset while later channels
+# (standalone binaries, Homebrew, Claude Code plugin) get wired up per waybill's
+# incremental pattern.
+#
+# What this workflow does today:
+#   1. preflight    - tag/version parity, clean tree, tests, lint, sync
+#   2. build        - per-package wheels + sdists to a shared artifact
+#   3. publish-*    - upload each public package to PyPI via API token
+#   4. container    - build + push + cosign-sign the multi-arch container image
+#   5. release      - create the GitHub Release with install instructions
+#   6. finalize     - summary line to the run's step summary
+#
+# Auth model: PyPI publishes use the `PYPI_API_TOKEN` repo secret (account-
+# scoped). Trusted-publisher setup is nicer long-term but requires per-project
+# UI config in PyPI, which was blocking. Container signing uses cosign keyless
+# OIDC as before; that path does not depend on PyPI auth.
+#
+# Version format: `vX.Y.Z` or `vX.Y.ZrcN` (no dash before rc; matches PEP 440
+# canonical form and the preflight parse-tag regex). Pre-release tags are
+# marked as GitHub prereleases; stable tags are marked `--latest`.
+#
+# Re-running against an already-tagged commit: use the workflow_dispatch entry
+# point with the tag as input. Push-triggered runs on a tag that already has a
+# GitHub Release are rejected in preflight.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+rc[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g., v0.1.0). Must already exist on the repo.'
+        required: true
+        type: string
+
+# Minimum permissions at the workflow level; per-job permissions narrow further.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.5.0"
+  # Single source of truth for the release ref. workflow_dispatch passes the
+  # tag as input; push-tag runs get it from github.ref_name.
+  TAG_NAME: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  preflight:
+    name: Preflight gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.parse-tag.outputs.version }}
+      is_prerelease: ${{ steps.parse-tag.outputs.is_prerelease }}
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.TAG_NAME }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Parse tag
+        id: parse-tag
+        env:
+          TAG: ${{ env.TAG_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            is_prerelease="false"
+          elif [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+rc[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            is_prerelease="true"
+          else
+            echo "::error::Tag '$TAG' does not match release pattern v<X.Y.Z> or v<X.Y.Z>rc<N>"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+          echo "Parsed: tag=$TAG version=$version is_prerelease=$is_prerelease"
+
+      - name: Reject re-tag when a GitHub Release already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.TAG_NAME }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::A GitHub Release already exists for tag $TAG. Re-runs on an already-published tag are rejected by design."
+            exit 1
+          fi
+
+      - name: Verify version parity across all public packages
+        env:
+          EXPECTED: ${{ steps.parse-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            # PyPI name → filesystem path. Two special cases: darnit-mcp
+            # lives at the repo root, and darnit-core lives at packages/darnit/
+            # (its directory name differs from its PyPI name for historical
+            # reasons). Every other package has directory == PyPI name.
+            case "$pkg" in
+              "darnit-mcp")  pyproject="pyproject.toml" ;;
+              "darnit-core") pyproject="packages/darnit/pyproject.toml" ;;
+              *)             pyproject="packages/$pkg/pyproject.toml" ;;
+            esac
+            if [ ! -f "$pyproject" ]; then
+              echo "::error::Public package $pkg has no pyproject.toml at $pyproject"
+              fail=1
+              continue
+            fi
+            actual=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' "$pyproject")
+            if [ "$actual" != "$EXPECTED" ]; then
+              echo "::error::Version mismatch in $pyproject: expected $EXPECTED, found $actual"
+              fail=1
+            else
+              echo "OK: $pkg pyproject.toml version=$actual matches tag"
+            fi
+          done < packaging/pypi/public-packages.txt
+          exit $fail
+
+      - name: Assert clean working tree at tagged commit
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code; then
+            echo "::error::Working tree has uncommitted changes against the tagged commit."
+            exit 1
+          fi
+          if ! git diff --cached --exit-code; then
+            echo "::error::Index has staged changes against the tagged commit."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          # Caching is intentionally disabled in the release pipeline.
+          # The blast radius of cache poisoning is significantly elevated
+          # here because this workflow produces and publishes artifacts;
+          # a poisoned cache from a prior run could inject content into
+          # the published wheels. Clean builds only.
+          enable-cache: false
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Tests
+        # Match ci.yml's mark exclusion. The `upstream` mark is on the CNCF
+        # .project/ spec-drift check, which is designed to be informational
+        # (docstring: "does NOT block PRs") and runs on a nightly schedule
+        # elsewhere. Preflight should not be stricter than the merge gate.
+        run: uv run pytest tests/ --ignore=tests/integration/ -m "not upstream" -q
+
+      - name: Spec sync
+        run: uv run python scripts/validate_sync.py --verbose
+
+  build:
+    name: Build public packages
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.TAG_NAME }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Build each public package into its own dist directory
+        run: |
+          set -euo pipefail
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            echo "::group::Building $pkg"
+            uv build --package "$pkg" --out-dir "dist/$pkg"
+            ls -la "dist/$pkg"
+            echo "::endgroup::"
+          done < packaging/pypi/public-packages.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publish jobs use `password: ${{ secrets.PYPI_API_TOKEN }}` (account-scoped
+  # token). Migrate to project-scoped tokens once the projects exist on PyPI.
+  #
+  # Sequenced via `needs:` because darnit-baseline, darnit-gittuf,
+  # darnit-reproducibility, and darnit-mcp declare `darnit-core>=...` runtime
+  # deps; darnit-mcp additionally depends on the other four. Publishing them
+  # before the deps are on the index briefly produces unresolvable wheels.
+
+  publish-darnit-core:
+    name: Publish darnit-core to PyPI
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish darnit-core
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/darnit-core/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  publish-darnit-baseline:
+    name: Publish darnit-baseline to PyPI
+    needs: [preflight, build, publish-darnit-core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish darnit-baseline
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/darnit-baseline/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  publish-darnit-gittuf:
+    name: Publish darnit-gittuf to PyPI
+    needs: [preflight, build, publish-darnit-core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish darnit-gittuf
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/darnit-gittuf/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  publish-darnit-reproducibility:
+    name: Publish darnit-reproducibility to PyPI
+    needs: [preflight, build, publish-darnit-core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish darnit-reproducibility
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/darnit-reproducibility/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  publish-darnit-mcp:
+    name: Publish darnit-mcp to PyPI
+    needs:
+      - preflight
+      - build
+      - publish-darnit-baseline
+      - publish-darnit-gittuf
+      - publish-darnit-reproducibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish darnit-mcp
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/darnit-mcp/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  # Build + push + cosign-sign the multi-arch container image. Depends on
+  # publish-darnit-mcp because the Dockerfile does `pip install
+  # darnit-mcp==<version>` at build time - the package must be live before
+  # the image build can resolve it.
+  container_build_push:
+    name: Build, push, and sign container image
+    needs:
+      - preflight
+      - publish-darnit-mcp
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write       # push to ghcr.io
+      id-token: write       # cosign keyless signing via OIDC
+    outputs:
+      image_digest: ${{ steps.build_push.outputs.digest }}
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.TAG_NAME }}
+          persist-credentials: false
+
+      - name: Set up QEMU (multi-arch emulation for arm64 build on amd64 runner)
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v3
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPO_OWNER}/darnit"
+          # Lowercase the owner name; GHCR rejects uppercase in repo paths.
+          image=$(echo "$image" | tr '[:upper:]' '[:lower:]')
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            # Pre-release: only the immutable version tag. Never move :latest.
+            tags="${image}:v${VERSION}"
+          else
+            tags="${image}:v${VERSION},${image}:latest"
+          fi
+          {
+            echo "image=$image"
+            echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tagging: $tags"
+
+      - name: Wait for darnit-mcp on PyPI
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          # PyPI's CDN typically caches the index for a few minutes after a
+          # new upload. Poll up to 2 minutes so the image build is not racing
+          # publication.
+          url="https://pypi.org/pypi/darnit-mcp/${VERSION}/json"
+          for attempt in $(seq 1 24); do
+            if curl -fsSL "$url" >/dev/null 2>&1; then
+              echo "darnit-mcp ${VERSION} is visible on PyPI (attempt $attempt)"
+              exit 0
+            fi
+            echo "Waiting for darnit-mcp ${VERSION} on PyPI (attempt $attempt/24)..."
+            sleep 5
+          done
+          echo "::error::darnit-mcp ${VERSION} did not appear on PyPI within 2 minutes"
+          exit 1
+
+      - name: Build and push multi-arch image
+        id: build_push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v6
+        with:
+          context: .
+          file: packaging/container/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ needs.preflight.outputs.version }}
+          provenance: true
+          sbom: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - name: Sign image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+          IMAGE: ${{ steps.tags.outputs.image }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  # Create the GitHub Release with install instructions. Simple version of what
+  # waybill does - no binary asset upload yet (that channel comes later).
+  release:
+    name: Create GitHub Release
+    needs:
+      - preflight
+      - publish-darnit-mcp
+      - container_build_push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          TAG: ${{ env.TAG_NAME }}
+        run: |
+          set -euo pipefail
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            flags="--prerelease"
+            title="darnit ${VERSION} (pre-release)"
+          else
+            flags="--latest"
+            title="darnit ${VERSION}"
+          fi
+          body_file=$(mktemp)
+          cat > "$body_file" <<EOF
+          # darnit ${VERSION}
+
+          First-cut release. See CHANGELOG or the tag diff for what's in it.
+
+          ## Install
+
+          - **MCP (Claude Code / Claude Desktop):** \`darnit install\` writes an \`uvx --from darnit-mcp\` config for you. See [docs/install/](https://github.com/${GITHUB_REPOSITORY}/tree/${TAG}/docs/install).
+          - **PyPI:** \`pip install darnit-mcp==${VERSION}\` (installs the meta-package plus \`darnit-core\`, \`darnit-baseline\`, \`darnit-gittuf\`, \`darnit-reproducibility\`).
+          - **Container:** \`docker pull ghcr.io/${owner_lc}/darnit:${TAG}\`.
+          - **Standalone binary / Homebrew:** not yet in this release. Tracked for follow-ups.
+
+          ## Verify (container image)
+
+          \`\`\`sh
+          cosign verify \\
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \\
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\
+            ghcr.io/${owner_lc}/darnit:${TAG}
+          \`\`\`
+          EOF
+
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --notes-file "$body_file" \
+            $flags
+
+  # Post-run summary. Never fails the workflow itself.
+  finalize:
+    name: Finalize
+    if: always()
+    needs:
+      - preflight
+      - publish-darnit-core
+      - publish-darnit-baseline
+      - publish-darnit-gittuf
+      - publish-darnit-reproducibility
+      - publish-darnit-mcp
+      - container_build_push
+      - release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Per-channel summary
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PYPI_CORE: ${{ needs.publish-darnit-core.result }}
+          PYPI_BASELINE: ${{ needs.publish-darnit-baseline.result }}
+          PYPI_GITTUF: ${{ needs.publish-darnit-gittuf.result }}
+          PYPI_REPRO: ${{ needs.publish-darnit-reproducibility.result }}
+          PYPI_MCP: ${{ needs.publish-darnit-mcp.result }}
+          CONTAINER: ${{ needs.container_build_push.result }}
+          RELEASE: ${{ needs.release.result }}
+        run: |
+          {
+            echo "## Release ${VERSION} - per-channel summary"
+            echo
+            echo "| Channel | Result |"
+            echo "|---|---|"
+            echo "| pypi-darnit-core | $PYPI_CORE |"
+            echo "| pypi-darnit-baseline | $PYPI_BASELINE |"
+            echo "| pypi-darnit-gittuf | $PYPI_GITTUF |"
+            echo "| pypi-darnit-reproducibility | $PYPI_REPRO |"
+            echo "| pypi-darnit-mcp | $PYPI_MCP |"
+            echo "| container | $CONTAINER |"
+            echo "| github-release | $RELEASE |"
+          } >> "$GITHUB_STEP_SUMMARY"

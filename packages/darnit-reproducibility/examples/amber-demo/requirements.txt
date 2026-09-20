@@ -1,0 +1,2 @@
+# Pinned so the capture records exact, reproducible library objects.
+numpy==1.26.4

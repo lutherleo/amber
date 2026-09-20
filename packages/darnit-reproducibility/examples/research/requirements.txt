@@ -1,0 +1,4 @@
+# Pinned scientific stack shared by the research examples, so captured library objects are exact.
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1

@@ -1,0 +1,43 @@
+## Summary
+
+<!-- Brief description of changes -->
+
+## Type of Change
+
+- [ ] Bug fix (non-breaking change fixing an issue)
+- [ ] New feature (non-breaking change adding functionality)
+- [ ] Breaking change (fix or feature causing existing functionality to change)
+- [ ] Documentation update
+- [ ] Refactoring (no functional changes)
+
+## Framework Changes Checklist
+
+If this PR modifies the darnit framework (`packages/darnit/`):
+
+- [ ] Updated framework spec (`docs/architecture/framework-design.md`) if behavior changed
+- [ ] Ran `uv run python scripts/validate_sync.py --verbose` and it passes
+
+## Control/TOML Changes Checklist
+
+If this PR modifies controls or TOML configuration:
+
+- [ ] Control metadata defined in TOML (not Python code)
+- [ ] SARIF fields (description, severity, help_url) included where appropriate
+- [ ] Ran validation to confirm TOML schema compliance
+
+## Testing
+
+- [ ] Tests pass locally (`uv run pytest tests/ -v`)
+- [ ] Added tests for new functionality (if applicable)
+- [ ] Linting passes (`uv run ruff check .`)
+
+## AI assistance
+
+- [ ] No AI assistance was used
+- [ ] AI assistance was used
+
+<!-- If used: which tool(s), and which parts of this PR are AI-generated. -->
+
+## Additional Notes
+
+<!-- Any additional context, screenshots, or information -->

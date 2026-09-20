@@ -1,0 +1,36 @@
+====================================================================
+AMBER CAPTURE REPORT
+====================================================================
+collection      : https://witness.testifysec.com/attestation-collection/v0.1
+attestors       : command-run, environment, git, lockfiles, material, product
+
+SYSTEM          : linux host=host user=researcher (34 env vars captured)
+REPO            : commit=69da1edd7e9e branch=master dirty=True matches python-env
+COMMAND         : ~/amber-research/.venv/bin/python experiment.py  -> exit 0
+FOLDER STASIS   : 30 files before; 2 created, 0 changed
+  + amber-pylibs.json  sha256:3ec35bf657cc1342  application/json
+  + result.json  sha256:f9a5cf3c2ffe4ec4  application/json
+PYTHON ENV      : CPython 3.12.3 (digest verified)
+  used deps      : 14 exercised (cloudpickle==3.1.2, derivative==0.6.3, joblib==1.6.0, narwhals==2.26.0, numpy==2.5.3, pandas==2.2.2, pysindy==2.1.0, python-dateutil==2.9.0.post0, pytz==2026.3.post1, scikit-learn==1.9.1, scipy==1.18.1, six==1.17.0…)
+  distributions : 18 installed
+  modules       : 1 first-party, 1320 third-party, 216 stdlib
+    [1st] __main__  sha256:a59994c33805a158
+    [3rd] _csparsetools  (scipy)  sha256:16206b6cf
+    [3rd] _cyutility  (scipy)  sha256:3225d1b8f
+    [3rd] _moduleTNC  (scipy)  sha256:97ff75823
+    [3rd] _ni_label  (scipy)  sha256:639e113ae
+    [3rd] cloudpickle  (cloudpickle)  sha256:12b2b2bea
+    [3rd] cloudpickle.cloudpickle  (cloudpickle)  sha256:29c2c0fee
+    [3rd] dateutil  (python-dateutil)  sha256:32a6a6ebb
+    [3rd] dateutil._common  (python-dateutil)  sha256:efbc34cb2
+HARDWARE        : Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz (8 cores, simd=avx,avx2,fma,sse4_2), 11.6GB, GPU NVIDIA GeForce GTX 1650 Ti drv 592.82
+NUMERICAL       : blas=scipy-openblas, threads={}, PYTHONHASHSEED=unset, tz=EST/EDT
+DEEP TRACE      : 210 native shared objects mapped (23 loaded outside the Python import system), 6 subprocess exec(s)
+    native: ~/amber-research/.venv/lib/python3.12/site-packages/scikit_learn.libs/libgomp-e985bcbb.so.1.0.0  sha256:a43904e4f
+    native: ~/amber-research/.venv/lib/python3.12/site-packages/scipy.libs/libgfortran-040039e1-0352e75f.so.5.0.0  sha256:c6090048e
+    native: ~/amber-research/.venv/lib/python3.12/site-packages/scipy.libs/libgfortran-83c28eba.so.5.0.0  sha256:468e71e59
+    native: ~/amber-research/.venv/lib/python3.12/site-packages/scipy.libs/libscipy_openblas-5f890258.so  sha256:2a5b4c1a6
+    native: ~/amber-research/.venv/lib/python3.12/site-packages/numpy.libs/libgfortran-83c28eba-468e71e5.so.5.0.0  sha256:a6a368328
+NETWORK (eBPF)  : captured=False unknown — no network-trace attestor in bundle
+====================================================================
+reproducible_result_sha256: f9a5cf3c2ffe4ec44d9baf379632e6744e9f90a15e7c47a3ad3fea6297d89f28 (verified across two independent captures)

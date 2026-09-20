@@ -1,0 +1,95 @@
+"""Tests for darnit_baseline.tools function signatures and imports.
+
+These tests catch issues like:
+- Parameter name mismatches (e.g., passing `repo_path` when function expects `local_path`)
+- Import errors (e.g., importing non-existent functions)
+- Signature incompatibilities between wrapper and underlying functions
+"""
+
+import inspect
+from collections.abc import Callable
+
+
+class TestToolsSignatures:
+    """Test that tool wrapper functions pass valid parameters to underlying functions."""
+
+    def _get_param_names(self, func: Callable) -> set[str]:
+        """Get parameter names from a function signature."""
+        sig = inspect.signature(func)
+        return set(sig.parameters.keys())
+
+    def test_remediate_audit_findings_signature(self) -> None:
+        """remediate_audit_findings wrapper should pass valid parameters."""
+        from darnit_baseline.remediation import remediate_audit_findings as impl
+        from darnit_baseline.tools import remediate_audit_findings as wrapper
+
+        self._get_param_names(wrapper)
+        impl_params = self._get_param_names(impl)
+
+        # Check that common parameters match
+        # The wrapper can have additional parameters, but any it passes to impl must exist
+        common_params = {'local_path', 'owner', 'repo', 'categories', 'dry_run'}
+        for param in common_params:
+            assert param in impl_params, f"Parameter '{param}' not in implementation"
+
+        # Specifically check that 'repo_path' is NOT a parameter (the bug we fixed)
+        assert 'repo_path' not in impl_params, "Implementation should not have 'repo_path' parameter"
+
+    def test_create_security_policy_signature(self) -> None:
+        """create_security_policy wrapper should have valid parameters."""
+        from darnit_baseline.tools import create_security_policy
+
+        wrapper_params = self._get_param_names(create_security_policy)
+
+        # Check expected parameters exist on the wrapper
+        expected = {'owner', 'repo', 'local_path', 'template'}
+        for param in expected:
+            assert param in wrapper_params, f"Parameter '{param}' not in wrapper"
+
+    def test_enable_branch_protection_signature(self) -> None:
+        """enable_branch_protection wrapper should pass valid parameters."""
+        from darnit.remediation.github import enable_branch_protection as impl
+
+        impl_params = self._get_param_names(impl)
+
+        # Check expected parameters exist
+        expected = {'owner', 'repo', 'branch', 'required_approvals', 'enforce_admins',
+                    'require_pull_request', 'require_status_checks', 'status_checks', 'dry_run'}
+        for param in expected:
+            assert param in impl_params, f"Parameter '{param}' not in implementation"
+
+
+class TestToolsSmoke:
+    """Smoke tests that verify tools can be called (with safe parameters)."""
+
+    def test_list_available_checks_callable(self) -> None:
+        """list_available_checks should be callable and return JSON."""
+        import json
+
+        from darnit_baseline.tools import list_available_checks
+
+        result = list_available_checks()
+        # Should return valid JSON
+        data = json.loads(result)
+        assert isinstance(data, dict)
+
+    def test_generate_threat_model_handles_missing_path(self) -> None:
+        """generate_threat_model should handle non-existent path gracefully."""
+        from darnit_baseline.tools import generate_threat_model
+
+        result = generate_threat_model(local_path="/nonexistent/path/12345")
+        assert "Error" in result or "not found" in result.lower()
+
+    def test_remediate_audit_findings_handles_missing_path(self) -> None:
+        """remediate_audit_findings should handle non-existent path gracefully."""
+        from darnit_baseline.tools import remediate_audit_findings
+
+        result = remediate_audit_findings(local_path="/nonexistent/path/12345", dry_run=True)
+        assert "Error" in result or "not found" in result.lower()
+
+    def test_audit_handles_missing_path(self) -> None:
+        """audit_openssf_baseline should handle non-existent path gracefully."""
+        from darnit_baseline.tools import audit_openssf_baseline
+
+        result = audit_openssf_baseline(local_path="/nonexistent/path/12345")
+        assert "Error" in result or "not found" in result.lower()

@@ -1,0 +1,89 @@
+# Amber deep capture on a native-Linux runner.
+#
+# eBPF attestors (network-trace + --trace) need root + a real Linux kernel, and Sigstore keyless
+# signing needs an OIDC token — none of which WSL/local provides reliably. This workflow is the
+# "deep mode" home: it captures a research example with eBPF, signs the bundle keyless via the
+# Actions OIDC identity, verifies it, and uploads it as evidence.
+name: amber-capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      example:
+        description: "research example under packages/darnit-reproducibility/examples/research/"
+        default: "lorenz"
+        type: string
+
+permissions:
+  id-token: write   # Sigstore/Fulcio keyless signing
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    env:
+      EXAMPLE: ${{ inputs.example || 'lorenz' }}
+      WITNESS_VERSION: "0.12.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install witness
+        run: |
+          set -euo pipefail
+          url="https://github.com/in-toto/witness/releases/download/v${WITNESS_VERSION}/witness_${WITNESS_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" -o /tmp/witness.tgz
+          tar xzf /tmp/witness.tgz -C /tmp witness
+          sudo mv /tmp/witness /usr/local/bin/witness
+          witness version
+
+      - name: Install amber (darnit-core + darnit-reproducibility + sigstore)
+        run: |
+          python -m pip install -U pip
+          pip install -e packages/darnit -e packages/darnit-reproducibility sigstore
+
+      - name: Set up the experiment (git repo + pinned deps)
+        run: |
+          set -euo pipefail
+          root="packages/darnit-reproducibility/examples/research"
+          work="$RUNNER_TEMP/exp"; mkdir -p "$work"
+          cp "$root/$EXAMPLE/experiment.py" "$work/"
+          if [ -f "$root/$EXAMPLE/requirements.txt" ]; then cp "$root/$EXAMPLE/requirements.txt" "$work/"; else cp "$root/requirements.txt" "$work/"; fi
+          pip install -r "$work/requirements.txt"
+          cd "$work"
+          git init -q
+          git -c user.email=ci@amber -c user.name=ci add -A
+          git -c user.email=ci@amber -c user.name=ci commit -qm "amber ci capture"
+
+      - name: Capture (deep eBPF + Sigstore keyless)
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/exp"; cd "$work"
+          # eBPF attestors need root; --sign uses the Actions OIDC (id-token: write). The harness
+          # re-invokes witness under sudo and preserves the capture env.
+          "$(which amber)" capture --step "ci-$EXAMPLE" -o "$work/bundle.json" \
+            --repo-root "$work" --sign -- python experiment.py
+
+      - name: Verify the capture (signed + eBPF network-trace present)
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/exp"
+          amber ingest "$work/bundle.json"
+          python - "$work/bundle.json" <<'PY'
+          import json, sys
+          env = json.load(open(sys.argv[1]))
+          assert env.get("signatures"), "bundle is not signed"
+          cert = env["signatures"][0].get("certificate")
+          assert cert, "no keyless certificate on the signature"
+          print("OK: bundle is Sigstore-signed with a certificate")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amber-bundle-${{ env.EXAMPLE }}
+          path: |
+            ${{ runner.temp }}/exp/bundle.json
+            ${{ runner.temp }}/exp/amber-pylibs.json

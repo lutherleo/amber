@@ -1,0 +1,193 @@
+[project]
+name = "darnit-mcp"
+version = "0.1.0"
+description = "MCP server for compliance auditing using the darnit framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Michael Lieberman" }
+]
+keywords = ["security", "compliance", "mcp", "openssf", "baseline", "osps"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "darnit-core",
+    "darnit-baseline",
+    "darnit-gittuf",
+    "darnit-reproducibility",
+]
+
+[project.urls]
+Homepage = "https://github.com/kusari-oss/darnit"
+Repository = "https://github.com/kusari-oss/darnit"
+Issues = "https://github.com/kusari-oss/darnit/issues"
+
+# darnit-mcp is a metadata-only meta-package: no source, only dependencies
+# that pull in darnit-core, darnit-baseline, darnit-gittuf, and
+# darnit-reproducibility. hatchling matches the backend the sibling packages
+# use; bypass-selection tells it to produce a wheel with no code payload.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[project.optional-dependencies]
+attestation = [
+    "darnit-core[attestation]",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.8.0",
+    "pre-commit>=4.0.0",
+    "vulture>=2.11",
+]
+# Feature 028 Tier 2 (PR #370): the coding-agent parity check imports
+# `claude_agent_sdk` (~90 MB). Isolate it here so `darnit-mcp[dev]`
+# stays lean -- Tier 2 CI installs `darnit-mcp[parity-tier2]`
+# explicitly. Not part of `[dev]` per PR #370 review feedback.
+parity-tier2 = [
+    "claude-agent-sdk>=0.1.0",
+    # Feature 029: Tier 2 parity check adds an OpenAI backend alongside the
+    # Claude Agent SDK path. TEST-ONLY dep; MUST NOT appear in any darnit
+    # product package's pyproject.toml (SC-006). Pinned >=1.50 for the
+    # Chat Completions tool-calling surface used by openai_backend.py.
+    "openai>=1.50",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+darnit-core = { workspace = true }
+darnit-baseline = { workspace = true }
+darnit-example = { workspace = true }
+darnit-gittuf = { workspace = true }
+darnit-reproducibility = { workspace = true }
+darnit-hello = { workspace = true }
+darnit-testchecks = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "unit: Unit tests (no external dependencies)",
+    "integration: Integration tests (may require git/gh)",
+    "slow: Slow tests",
+    "upstream: Upstream spec sync tests (run nightly, excluded by default)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:darnit_baseline.rules",
+]
+
+[tool.coverage.run]
+source = ["packages/darnit/src", "packages/darnit-baseline/src"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.3.0",
+    "mypy>=1.8.0",
+    "ruff>=0.8.0",
+    "skills-ref>=0.1.1",
+    "jsonschema>=4.26.0",
+    "syrupy>=4.0.0",  # snapshot testing for threat-model rendering (014-cobra-threat-model R8)
+    # Internal/test-only workspace packages -- not published to PyPI. Pinned here
+    # so they install for development and tests via `uv sync`, but do not become
+    # runtime dependencies of any published wheel.
+    "darnit-example",
+    "darnit-hello",
+    "darnit-testchecks",  # framework used by tests/darnit/cli/ (feature 024)
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+strict_equality = true
+# Gradually enable stricter checks
+packages = [
+    "darnit",
+    "darnit_baseline",
+]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    ".eggs",
+    # Intentionally broken syntax fixture for FR-019 (parser error recovery test)
+    "tests/darnit_baseline/threat_model/fixtures/red_herrings/broken_syntax.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "F",      # Pyflakes (includes F401 unused imports, F841 unused variables)
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort (import sorting)
+    "UP",     # pyupgrade (Python version upgrades)
+    "B",      # flake8-bugbear (common bugs)
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E731",   # lambda assignment (sometimes useful)
+    "B008",   # function call in default argument (needed for FastAPI/MCP)
+    "SIM102", # nested if (sometimes more readable than combined)
+    "SIM105", # contextlib.suppress (explicit try-except often clearer)
+    "SIM108", # ternary operator (readability preference)
+    "SIM110", # any() suggestion (explicit loop often clearer)
+    "SIM116", # dict comprehension (sometimes explicit is clearer)
+    "UP042",  # StrEnum suggestion (pre-existing, not introduced by this PR)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "SIM", "E402"]  # Less strict for tests, allow late imports
+"scripts/*" = ["E402"]  # Allow late imports in scripts
+"docs/examples/*" = ["B", "SIM", "E402"]  # Less strict for examples
+
+[tool.ruff.lint.isort]
+known-first-party = ["darnit", "darnit_baseline", "darnit_example"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "docs/examples"]
+skips = ["B101"]  # Allow assert statements

@@ -1,0 +1,29 @@
+name: Generate SBOM
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          artifact-name: sbom-${{ github.event.release.tag_name || 'snapshot' }}.spdx.json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM as release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        with:
+          files: sbom.spdx.json

@@ -1,0 +1,1336 @@
+"""Darnit CLI - Declarative compliance auditing.
+
+A Terraform-like CLI for running compliance audits against repositories.
+
+IMPORTANT: This CLI is primarily intended for debugging and development.
+For production use, run darnit as an MCP server which enables full LLM
+consultation capabilities for intelligent check analysis.
+
+Usage:
+    darnit serve [OPTIONS]              # Start MCP server (RECOMMENDED)
+    darnit audit [OPTIONS] [REPO_PATH]  # Debug: Run audit without LLM
+    darnit plan [OPTIONS] [REPO_PATH]   # Debug: Show execution plan
+    darnit validate [OPTIONS] PATH      # Validate framework config
+    darnit init [OPTIONS] [REPO_PATH]   # Initialize .baseline.toml
+    darnit list [OPTIONS]               # List available frameworks
+
+Examples:
+    # Start the MCP server (recommended for production)
+    darnit serve
+    darnit serve --framework <name>
+
+    # Debug/development commands (no LLM consultation)
+    darnit audit /path/to/repo
+    darnit plan --tags level=1 /path/to/repo
+"""
+
+import argparse
+import importlib.metadata
+import json
+import os
+import sys
+from pathlib import Path
+
+from darnit.core.logging import configure_logging, get_logger
+from darnit.sieve.models import CheckResult
+
+logger = get_logger("cli")
+
+
+def _resolve_version() -> str:
+    """Return the installed `darnit-core` version, or `"dev"` if unresolved.
+
+    The PyPI distribution name is `darnit-core` (the import name and CLI
+    command both remain `darnit`). When darnit is run from a source
+    checkout without an editable install — or when a stale binary on
+    PATH outside the workspace venv is invoked — the distribution
+    metadata isn't on the import path. Fall back to `"dev"` so
+    `darnit --version` never crashes on what is effectively a "no
+    metadata available" condition.
+    """
+    try:
+        return importlib.metadata.version("darnit-core")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
+# Output Formatters
+
+
+def format_result_text(result: dict) -> str:
+    """Format a single result for text output."""
+    status = result.get("status", "UNKNOWN")
+    control_id = result.get("id", "?")
+    details = result.get("details", "")
+
+    # Status indicators
+    status_icons = {
+        "PASS": "✓",
+        "FAIL": "✗",
+        "WARN": "⚠",
+        "ERROR": "!",
+        "N/A": "-",
+    }
+    icon = status_icons.get(status, "?")
+
+    # Feature 036: annotate environmental failures so triage from this
+    # output alone is possible -- "[auth]" means fix the token, an
+    # unannotated FAIL means fix the repo.
+    error_class = result.get("error_class")
+    ec_tag = f" [{error_class}]" if error_class else ""
+
+    return f"  {icon} {control_id}: {status}{ec_tag} - {details}"
+
+
+def format_results_text(results: list[CheckResult], framework_name: str, show_all: bool = False) -> str:
+    """Format all results for text output."""
+    lines = [f"\n=== {framework_name} Audit Results ===\n"]
+
+    # Group by status
+    by_status = {}
+    for r in results:
+        status = r.get("status", "UNKNOWN")
+        by_status.setdefault(status, []).append(r)
+
+    # Summary
+    total = len(results)
+    passed = len(by_status.get("PASS", []))
+    failed = len(by_status.get("FAIL", []))
+    warned = len(by_status.get("WARN", []))
+    na = len(by_status.get("N/A", []))
+
+    lines.append(f"Total: {total} | Pass: {passed} | Fail: {failed} | Warn: {warned} | N/A: {na}\n")
+
+    # Show failures first
+    if "FAIL" in by_status:
+        lines.append("\n--- Failures ---")
+        for r in by_status["FAIL"]:
+            lines.append(format_result_text(r))
+
+    # Show warnings
+    if "WARN" in by_status:
+        lines.append("\n--- Warnings ---")
+        for r in by_status["WARN"]:
+            lines.append(format_result_text(r))
+
+    # Show passes
+    if "PASS" in by_status:
+        lines.append(f"\n--- Passed ({len(by_status['PASS'])}) ---")
+        passes = by_status["PASS"] if show_all else by_status["PASS"][:10]
+        for r in passes:
+            lines.append(format_result_text(r))
+        if not show_all and len(by_status["PASS"]) > 10:
+            lines.append(
+                f"  ... and {len(by_status['PASS']) - 10} more "
+                "(use --show-all to list every check)"
+            )
+
+    # With --show-all, list every remaining status (e.g. N/A) so the output
+    # documents every check for conformance evidence.
+    if show_all:
+        for status, group in by_status.items():
+            if status in ("FAIL", "WARN", "PASS"):
+                continue
+            lines.append(f"\n--- {status} ({len(group)}) ---")
+            for r in group:
+                lines.append(format_result_text(r))
+
+    return "\n".join(lines)
+
+
+def format_results_json(results: list[CheckResult], framework_name: str) -> str:
+    """Format results as JSON."""
+    output = {
+        "framework": framework_name,
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "pass": len([r for r in results if r.get("status") == "PASS"]),
+            "fail": len([r for r in results if r.get("status") == "FAIL"]),
+            "warn": len([r for r in results if r.get("status") == "WARN"]),
+            "na": len([r for r in results if r.get("status") == "N/A"]),
+        },
+    }
+    return json.dumps(output, indent=2)
+
+
+# Commands
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Run compliance audit against a repository.
+
+    NOTE: This command runs without LLM consultation. Checks requiring
+    LLM analysis will return WARN/inconclusive. For full capabilities,
+    use 'darnit serve' and connect via MCP.
+    """
+    from darnit.config import (
+        load_controls_from_effective,
+        load_effective_config,
+        load_effective_config_auto,
+        load_effective_config_by_name,
+    )
+    from darnit.filtering import filter_controls, parse_tags_arg
+
+    # Warn about limited functionality in terminal mode
+    logger.warning(
+        "Running in terminal mode (no LLM consultation). "
+        "For full capabilities, use 'darnit serve' with an MCP client."
+    )
+
+    repo_path = Path(args.repo_path).resolve()
+    if not repo_path.exists():
+        logger.error(f"Repository path not found: {repo_path}")
+        return 1
+
+    # Load configuration
+    try:
+        if args.framework:
+            framework_path = Path(args.framework)
+            if framework_path.exists():
+                config = load_effective_config(framework_path, repo_path)
+            else:
+                # Try as framework name
+                config = load_effective_config_by_name(args.framework, repo_path)
+        else:
+            config = load_effective_config_auto(repo_path)
+    except ValueError as e:
+        logger.error(f"Failed to load framework: {e}")
+        return 1
+    except FileNotFoundError as e:
+        logger.error(f"Framework not found: {e}")
+        return 1
+
+    # Load controls
+    controls = load_controls_from_effective(config)
+    if not controls:
+        logger.warning("No controls loaded from configuration")
+        return 0
+
+    # Build filters from --tags
+    filters = parse_tags_arg(args.tags) if args.tags else []
+
+    # Parse include/exclude lists
+    include_ids = set(args.include.split(",")) if args.include else None
+    exclude_ids = set(args.exclude.split(",")) if args.exclude else set()
+
+    # Apply filters
+    controls = filter_controls(controls, filters, include_ids, exclude_ids)
+
+    logger.info(f"Auditing {repo_path} with {len(controls)} controls")
+
+    # Detect owner/repo from git if available
+    from darnit.core.utils import detect_owner_repo
+
+    owner, repo = detect_owner_repo(str(repo_path))
+    default_branch = _detect_default_branch(repo_path)
+
+    # Delegate to canonical audit pipeline
+    from darnit.tools.audit import run_sieve_audit
+
+    results, _summary = run_sieve_audit(
+        owner=owner,
+        repo=repo,
+        local_path=str(repo_path),
+        default_branch=default_branch,
+        level=3,
+        controls=controls,
+        framework_name=config.framework_name,  # so plugin sieve handlers get registered
+        apply_user_config=False,  # CLI already applied filters above
+        stop_on_llm=True,
+    )
+
+    # Output results
+    if args.output == "json":
+        sys.stdout.write(format_results_json(results, config.framework_name) + "\n")
+    else:
+        sys.stdout.write(
+            format_results_text(results, config.framework_name, show_all=args.show_all) + "\n"
+        )
+
+    # Return non-zero if any failures
+    failures = [r for r in results if r.get("status") == "FAIL"]
+    return 1 if failures and not args.no_fail else 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Show what would be checked (dry-run).
+
+    NOTE: This is a debug/development command. For production use,
+    run 'darnit serve' and connect via MCP.
+    """
+    from darnit.config import (
+        load_effective_config,
+        load_effective_config_auto,
+        load_effective_config_by_name,
+    )
+    from darnit.filtering import matches_filters, parse_tags_arg
+
+    repo_path = Path(args.repo_path).resolve()
+
+    # Load configuration
+    try:
+        if args.framework:
+            framework_path = Path(args.framework)
+            if framework_path.exists():
+                config = load_effective_config(framework_path, repo_path if repo_path.exists() else None)
+            else:
+                config = load_effective_config_by_name(args.framework, repo_path if repo_path.exists() else None)
+        else:
+            config = load_effective_config_auto(repo_path)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Failed to load framework: {e}")
+        return 1
+
+    # Build filters from --tags
+    filters = parse_tags_arg(args.tags) if args.tags else []
+
+    # Parse include/exclude lists
+    include_ids = set(args.include.split(",")) if args.include else None
+    exclude_ids = set(args.exclude.split(",")) if args.exclude else set()
+
+    logger.info(f"=== Execution Plan: {config.framework_name} ===")
+    logger.info(f"Framework: {config.framework_name} v{config.framework_version}")
+    if config.spec_version:
+        logger.info(f"Spec: {config.spec_version}")
+    logger.info(f"Repository: {repo_path}")
+    if filters:
+        logger.info(f"Filters: {', '.join(f'{f.field}{f.operator}{f.value}' for f in filters)}")
+    if include_ids:
+        logger.info(f"Include: {', '.join(sorted(include_ids))}")
+    if exclude_ids:
+        logger.info(f"Exclude: {', '.join(sorted(exclude_ids))}")
+
+    # Group controls by level
+    by_level = {}
+    for cid, ctrl in config.controls.items():
+        level = ctrl.level
+        by_level.setdefault(level, []).append((cid, ctrl))
+
+    total_shown = 0
+    total_filtered = 0
+
+    for level in sorted(by_level.keys()):
+        controls = by_level[level]
+        shown_controls = []
+
+        for cid, ctrl in sorted(controls, key=lambda x: x[0]):
+            # Apply include/exclude lists
+            if include_ids and cid not in include_ids:
+                total_filtered += 1
+                continue
+            if cid in exclude_ids:
+                total_filtered += 1
+                continue
+            # Apply filters
+            if not matches_filters(ctrl, filters):
+                total_filtered += 1
+                continue
+            shown_controls.append((cid, ctrl))
+
+        if not shown_controls:
+            continue
+
+        logger.info(f"Level {level} ({len(shown_controls)} controls):")
+        for cid, ctrl in shown_controls:
+            if ctrl.is_applicable():
+                adapter = ctrl.check_adapter
+                logger.info(f"  • {cid}: {ctrl.name} [adapter: {adapter}]")
+            else:
+                logger.info(f"  - {cid}: {ctrl.name} [skipped: {ctrl.status_reason}]")
+        total_shown += len(shown_controls)
+
+    if total_filtered > 0:
+        logger.info(f"({total_filtered} controls filtered out)")
+
+    # Show excluded controls
+    excluded = config.get_excluded_controls()
+    if excluded:
+        logger.info(f"Excluded ({len(excluded)}):")
+        for cid, reason in excluded.items():
+            logger.info(f"  - {cid}: {reason}")
+
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Validate a framework configuration file."""
+    from darnit.config import load_framework_config, validate_framework_config
+
+    framework_path = Path(args.framework_path)
+    if not framework_path.exists():
+        logger.error(f"Framework file not found: {framework_path}")
+        return 1
+
+    try:
+        config = load_framework_config(framework_path)
+    except Exception as e:
+        logger.error(f"Failed to parse framework: {e}")
+        return 1
+
+    errors = validate_framework_config(config)
+
+    if errors:
+        logger.error(f"Validation failed with {len(errors)} error(s):")
+        for error in errors:
+            logger.error(f"  • {error}")
+        return 1
+    else:
+        logger.info(f"Framework '{config.metadata.name}' is valid")
+        logger.info(f"  Controls: {len(config.controls)}")
+        logger.info(f"  Adapters: {len(config.adapters)}")
+
+        # Show level breakdown
+        by_level = {}
+        for _cid, ctrl in config.controls.items():
+            by_level.setdefault(ctrl.level, 0)
+            by_level[ctrl.level] += 1
+
+        logger.info(f"  By level: {', '.join(f'L{k}={v}' for k, v in sorted(by_level.items()))}")
+        return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize a .baseline.toml file."""
+    repo_path = Path(args.repo_path).resolve()
+    baseline_path = repo_path / ".baseline.toml"
+
+    if baseline_path.exists() and not args.force:
+        logger.error(".baseline.toml already exists. Use --force to overwrite.")
+        return 1
+
+    # Auto-detect framework from installed implementations
+    if args.framework:
+        framework = args.framework
+    else:
+        from darnit.core.discovery import discover_implementations
+        impls = discover_implementations()
+        if len(impls) == 1:
+            framework = next(iter(impls))
+        else:
+            framework = "openssf-baseline"
+
+    template = f'''# Darnit configuration file
+# See: https://github.com/kusari-oss/darnit
+
+version = "1.0"
+extends = "{framework}"
+
+[settings]
+cache_results = true
+timeout = 300
+
+# Adapter definitions (uncomment to use external tools)
+# [adapters.kusari]
+# type = "command"
+# command = "kusari"
+# output_format = "json"
+
+# Control overrides
+# [controls."CONTROL-ID"]
+# status = "n/a"
+# reason = "Pre-release project"
+
+# Use custom adapter for specific controls
+# [controls."CONTROL-ID"]
+# check = {{ adapter = "kusari" }}
+'''
+
+    baseline_path.write_text(template, encoding="utf-8")
+    logger.info(f"✓ Created {baseline_path}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List available frameworks."""
+    from darnit.config import list_available_frameworks, load_framework_by_name
+
+    frameworks = list_available_frameworks()
+
+    if not frameworks:
+        logger.info("No frameworks found. Install a framework package like darnit-baseline.")
+        return 0
+
+    logger.info("Available Frameworks:")
+    for name in frameworks:
+        try:
+            config = load_framework_by_name(name)
+            logger.info(f"  • {name}")
+            logger.info(f"    Display: {config.metadata.display_name}")
+            logger.info(f"    Version: {config.metadata.version}")
+            if config.metadata.spec_version:
+                logger.info(f"    Spec: {config.metadata.spec_version}")
+            logger.info(f"    Controls: {len(config.controls)}")
+        except Exception as e:
+            logger.info(f"  • {name} (error loading: {e})")
+
+    return 0
+
+def cmd_profiles(args: argparse.Namespace) -> int:
+    """List available audit profiles defined by loaded implementations."""
+    from darnit.core.discovery import discover_implementations
+
+    impls = discover_implementations()
+    if not impls:
+        logger.info("No implementations found.")
+        return 0
+
+    filter_impl = getattr(args, "impl", None)
+    found_any = False
+
+    for name, impl in impls.items():
+        if filter_impl and name != filter_impl:
+            continue
+        get_profiles = getattr(impl, "get_audit_profiles", None)
+        if not callable(get_profiles):
+            continue
+        profiles = get_profiles()
+        if not profiles:
+            continue
+        found_any = True
+        logger.info(f"{name}:")
+        for profile_name, profile in profiles.items():
+            ctrl_count = len(profile.controls) if profile.controls else "tag-based"
+            logger.info(f"  {profile_name:<25} {profile.description} ({ctrl_count} controls)")
+
+    if not found_any:
+        logger.info("No audit profiles defined by any implementation.")
+
+    return 0
+
+def _find_skills_dir() -> Path | None:
+    """Find the skills directory from the darnit package."""
+    skills_dir = Path(__file__).parent / "skills"
+    if skills_dir.is_dir():
+        has_skills = any(
+            (d / "SKILL.md").exists() for d in skills_dir.iterdir() if d.is_dir()
+        )
+        if has_skills:
+            return skills_dir
+    return None
+
+
+def _install_skills(target_dir: Path, force: bool = False) -> int:
+    """Copy skill directories to a target location."""
+    import shutil
+
+    source = _find_skills_dir()
+    if source is None:
+        logger.warning("No skills found in darnit-baseline package. Skipping skill installation.")
+        return 0
+
+    skill_dirs = [d for d in source.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
+    if not skill_dirs:
+        logger.warning("No valid skill directories found.")
+        return 0
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    installed = 0
+
+    for skill_dir in skill_dirs:
+        dest = target_dir / skill_dir.name
+        if dest.exists() and not force:
+            logger.info(f"  Skill '{skill_dir.name}' already exists at {dest}, skipping (use --force to overwrite)")
+            continue
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(skill_dir, dest)
+        installed += 1
+        logger.info(f"  ✓ Installed skill '{skill_dir.name}' → {dest}")
+
+    return installed
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Install darnit MCP server config and skills into a supported client."""
+    import shutil
+
+    if args.client == "claude":
+        logger.warning(
+            "`--client claude` is deprecated; use `--client claude-code` for Claude Code "
+            "or `--client claude-desktop` for Claude Desktop."
+        )
+    if args.project and args.client not in ("claude", "claude-code"):
+        logger.warning(
+            "`--project` only applies to Claude Code (writes .mcp.json). "
+            f"Ignoring --project for --client {args.client}."
+        )
+
+    if args.client in ("claude", "claude-code"):
+        if args.project:
+            settings_path = Path.cwd() / ".mcp.json"
+        else:
+            settings_path = Path.home() / ".claude.json"
+    elif args.client == "claude-desktop":
+        if sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support" / "Claude"
+        elif sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "Claude"
+        else:
+            base = Path.home() / ".config" / "Claude"
+        settings_path = base / "claude_desktop_config.json"
+    else:  # cursor
+        settings_path = Path.home() / ".cursor" / "mcp.json"
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config = {}
+    if settings_path.exists():
+        try:
+            config = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in settings file: {settings_path}: {e}")
+            return 1
+
+        backup_path = settings_path.with_suffix(settings_path.suffix + ".bak")
+        shutil.copy2(settings_path, backup_path)
+
+    mcp_servers = config.setdefault("mcpServers", {})
+    darnit_entry = {
+        "command": "uvx",
+        "args": ["--from", "darnit-mcp", "darnit", "serve"],
+    }
+
+    if "darnit" in mcp_servers and not args.force:
+        response = input(f"'darnit' entry already exists in {settings_path}. Overwrite? [y/N]: ").strip().lower()
+        if response not in {"y", "yes"}:
+            logger.info("Install cancelled.")
+            return 1
+
+    mcp_servers["darnit"] = darnit_entry
+
+    try:
+        json.dumps(config)  # validate before write
+        settings_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to write settings file: {e}")
+        return 1
+
+    logger.info(f"✓ Installed darnit MCP server config in {settings_path}")
+
+    # Install skills
+    if not args.mcp_only and args.client in ("claude", "claude-code"):
+        if args.project:
+            skills_target = Path.cwd() / ".claude" / "skills"
+            logger.info(f"Installing skills (project) → {skills_target}")
+        else:
+            skills_target = Path.home() / ".claude" / "skills"
+            logger.info(f"Installing skills (global) → {skills_target}")
+
+        count = _install_skills(skills_target, force=args.force)
+        if count > 0:
+            logger.info(f"✓ Installed {count} skill(s)")
+        elif count == 0:
+            logger.info("  No new skills to install")
+    elif args.mcp_only:
+        logger.info("  Skipping skill installation (--mcp-only)")
+
+    logger.info("Next step: restart your AI client and use the configured MCP server.")
+    logger.info("Skills available: /darnit-audit, /darnit-data, /darnit-comply, /darnit-remediate")
+    return 0
+
+# Safety ceiling on audit<->collect_context rounds. Each iteration resolves ALL
+# pending questions in one batch (the answers comprehension in cmd_run), so this
+# bounds re-audit rounds, not the number of controls.
+MAX_AGENT_ITERATIONS = 10
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run the audit workflow with human feedback.
+
+    Runs the audit -> collect_context -> remediate pipeline. Checks that
+    require LLM judgement halt for an external agent (e.g. Claude Code);
+    questions needing a human are handled per --feedback mode. Automated
+    in-process LLM backends are not wired into this command yet.
+    """
+    from darnit.agent.feedback import get_feedback_handler
+    from darnit.agent.graph import audit, collect_context, remediate, route
+    from darnit.agent.state import AuditState
+
+    repo_path = str(Path(args.repo_path).resolve())
+
+    # Feedback mode — default to interactive if terminal, noninteractive if not
+    feedback_mode = args.feedback_mode
+    if feedback_mode == "auto":
+        feedback_mode = "interactive" if sys.stdin.isatty() else "noninteractive"
+
+    print("\nDarnit run")
+    print(f"  Repository : {repo_path}")
+    print(f"  Feedback   : {feedback_mode}")
+    print()
+
+    # framework_name=None auto-resolves from .baseline.toml inside audit().
+    state = AuditState(
+        local_path=repo_path,
+        framework_name=getattr(args, "framework", None),
+        level=getattr(args, "level", 3),
+    )
+
+    feedback = get_feedback_handler(feedback_mode)
+
+    # Inline orchestration (replaces LangGraph): audit, then route() decides the
+    # next node ("audit" | "collect_context" | "remediate" | "end"). A re-audit
+    # is only meaningful right after collect_context (which clears audit_results
+    # to request one), so we re-audit inside that branch. A bare "audit" from
+    # route here means the audit produced no results — stop rather than spin.
+    try:
+        state = audit(state)
+        for _ in range(MAX_AGENT_ITERATIONS):
+            if state.error:
+                break
+            step = route(state)
+            if step == "collect_context":
+                # Noninteractive ask() always returns None -> answers ends up
+                # empty -> we break below with questions left queued for the
+                # summary. Interactive prompts the user.
+                answers = {
+                    q.context_key: (feedback.ask(q.control_id, q.question) or "")
+                    for q in state.feedback_questions
+                    if not q.answered
+                }
+                answers = {k: v for k, v in answers.items() if v}
+                if not answers:
+                    break  # nothing answered — avoid re-routing forever
+                state = collect_context(state, answers)
+                state = audit(state)  # re-audit with confirmed context
+            elif step == "remediate":
+                state = remediate(state, dry_run=getattr(args, "dry_run", False))
+                break
+            else:  # "audit" (no results) or "end"
+                break
+    except Exception as e:
+        logger.error(f"Agent run failed: {e}")
+        return 1
+
+    final_state = state
+
+    # AuditState is a dataclass — attribute access, real field names.
+    check_results = final_state.audit_results or []
+    error = final_state.error
+
+    total = len(check_results)
+    passed = len([r for r in check_results if r.get("status") == "PASS"])
+    failed = len([r for r in check_results if r.get("status") == "FAIL"])
+    warned = len([r for r in check_results if r.get("status") == "WARN"])
+
+    print("Run complete.")
+    print(f"  Total  : {total}")
+    print(f"  Passed : {passed}")
+    print(f"  Failed : {failed}")
+    print(f"  Warned : {warned}")
+
+    # Pending human feedback — FeedbackQuestion is a dataclass, not a dict.
+    pending = [q for q in final_state.feedback_questions if not q.answered]
+    if pending:
+        print(f"\nPending human feedback ({len(pending)} unanswered):")
+        for q in pending:
+            print(f"  Control : {q.control_id}")
+            print(f"  Question: {q.question}")
+            print()
+
+    if error:
+        print(f"\nError: {error}")
+        return 1
+
+    return 1 if failed else 0
+
+def cmd_harness(args: argparse.Namespace) -> int:
+    """Run the harness: end-to-end audit with in-band LLM dispatch.
+
+    Feature 026. Non-interactive by default; consumes ANTHROPIC_API_KEY
+    from env; dispatches LLM steps via PydanticAILLMStep; produces a
+    Markdown or JSON report; exits with a documented code.
+    """
+    import asyncio
+    import sys
+
+    from darnit.core.llm_step import PydanticAILLMStep
+    from darnit.harness.answer_sources import AnswerSourceLoadError
+    from darnit.harness.driver import (
+        HarnessRun,
+        HarnessRunTimeout,
+        HarnessSetupError,
+    )
+    from darnit.harness.exit_codes import HarnessExitCode
+
+    repo_path = str(Path(args.repo_path).resolve())
+    output_format = getattr(args, "format", "markdown")
+    output_path = getattr(args, "output", None)
+    answers_path = getattr(args, "answers", None)
+    interactive = getattr(args, "interactive", False)
+    per_resolver_timeout_s = getattr(args, "per_resolver_timeout", None)
+
+    # Feature 027: --interactive fail-fast guard (IR-7..IR-9 / SC-005).
+    # Must run BEFORE any control iteration so a CI misfire never silently
+    # skips every question.
+    if interactive:
+        if not sys.stdin.isatty():
+            _emit_exit_summary(
+                "setup_error, interactive channel unavailable "
+                "(stdin is not a TTY)",
+                HarnessExitCode.SETUP_ERROR,
+            )
+            return int(HarnessExitCode.SETUP_ERROR)
+        try:
+            _tty_probe = open("/dev/tty", "r+", buffering=1, encoding="utf-8")  # noqa: SIM115
+            _tty_probe.close()
+        except OSError as exc:
+            _emit_exit_summary(
+                "setup_error, interactive channel unavailable "
+                f"(/dev/tty not openable: {exc.strerror or type(exc).__name__})",
+                HarnessExitCode.SETUP_ERROR,
+            )
+            return int(HarnessExitCode.SETUP_ERROR)
+
+    # Build the resolver via the explicit factory. Any AnswerSourceLoadError
+    # from a bad --answers file surfaces as a SETUP_ERROR.
+    try:
+        resolver = HarnessRun.build_default_resolver(
+            local_path=repo_path,
+            answers_path=answers_path,
+        )
+    except AnswerSourceLoadError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+    except FileNotFoundError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+
+    # Feature 027: build the QuestionResolver chain via entry-point discovery.
+    # PR #367 review Constitution IV fix: external resolvers stay out of the
+    # chain unless --allow-external-resolvers is set. An answer they produce
+    # is recorded with authority="asserted", so silent invocation would let
+    # any installed third-party package produce dispositive-strength values
+    # without operator opt-in.
+    allow_external_resolvers = getattr(args, "allow_external_resolvers", False)
+    try:
+        question_resolvers = HarnessRun.build_default_resolver_chain(
+            interactive=interactive,
+            allow_external_resolvers=allow_external_resolvers,
+        )
+    except HarnessSetupError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+
+    if question_resolvers:
+        harness_logger = get_logger("harness")
+        harness_logger.info(
+            "harness: resolvers configured: %s",
+            [getattr(r, "name", "unknown") for r in question_resolvers],
+        )
+
+    run = HarnessRun(
+        local_path=repo_path,
+        framework_name=getattr(args, "framework", None),
+        level=getattr(args, "level", 3),
+        answer_resolver=resolver,
+        llm_step=PydanticAILLMStep(),
+        per_call_timeout_s=getattr(args, "per_call_timeout", 60),
+        total_run_timeout_s=getattr(args, "total_run_timeout", 900),
+        question_resolvers=question_resolvers,
+        per_resolver_timeout_s=per_resolver_timeout_s,
+    )
+
+    try:
+        report = asyncio.run(run.run())
+    except HarnessSetupError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+    except HarnessRunTimeout as exc:
+        _emit_exit_summary(f"internal_error, {exc}", HarnessExitCode.INTERNAL_ERROR)
+        return int(HarnessExitCode.INTERNAL_ERROR)
+    except Exception as exc:
+        _emit_exit_summary(
+            f"internal_error, {type(exc).__name__}: {exc}",
+            HarnessExitCode.INTERNAL_ERROR,
+        )
+        return int(HarnessExitCode.INTERNAL_ERROR)
+
+    # Render the report
+    if output_format == "json":
+        text = report.to_json()
+    else:
+        text = report.to_markdown()
+
+    if output_path:
+        Path(output_path).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+
+    # Exit summary. Order matches CLI-13 exactly:
+    #   `complete, <P> PASS, <F> FAIL, <W> WARN, <PEND> pending, exit <N>`
+    # so CI parsers written against the contract keep working. Answered
+    # count is appended AFTER `pending`; the CLI-13 grep pattern is a
+    # prefix match on positional fields, so the extra trailing field is
+    # additive rather than positional-shifting. PR #367 review fix.
+    s = report.summary
+    answered_count = len(report.answered_feedback)
+    pending_count = len(report.pending_feedback)
+    _emit_exit_summary(
+        f"complete, {s.pass_} PASS, {s.fail} FAIL, {s.warn} WARN, "
+        f"{pending_count} pending, {answered_count} answered",
+        HarnessExitCode(report.exit_class),
+    )
+    return report.exit_class
+
+
+def _emit_exit_summary(reason: str, exit_code: int) -> None:
+    """Emit the one-line stderr summary before process exit (contract CLI-13)."""
+    harness_logger = get_logger("harness")
+    harness_logger.info("harness: %s, exit %d", reason, int(exit_code))
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the MCP server.
+
+    Supports two modes:
+    1. With config file: `darnit serve config.toml` - Uses TOML-defined tools
+    2. Without config: `darnit serve` - Auto-detects framework (legacy mode)
+    """
+    import os
+
+    try:
+        from darnit.server import create_server
+    except ImportError:
+        logger.error("MCP server dependencies not installed. Run: pip install mcp")
+        return 1
+
+    config_path = getattr(args, "config", None)
+
+    if config_path:
+        # New mode: Use TOML config file
+        if not os.path.exists(config_path):
+            logger.error(f"Config file not found: {config_path}")
+            return 1
+
+        try:
+            server = create_server(config_path)
+            logger.info(f"Starting MCP server from {config_path}")
+            server.run()
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to create server: {e}")
+            return 1
+    else:
+        # Legacy mode: Auto-detect framework
+        # For now, try to find a framework config
+        from darnit.config import list_available_frameworks, resolve_framework_path
+
+        framework_name = getattr(args, "framework", None)
+        if not framework_name:
+            frameworks = list_available_frameworks()
+            if frameworks:
+                framework_name = frameworks[0]  # Default to first available
+            else:
+                logger.error(
+                    "No framework specified and none found. "
+                    "Use 'darnit serve config.toml' or install a framework package."
+                )
+                return 1
+
+        # Get framework path and use it as config
+        try:
+            framework_path = resolve_framework_path(framework_name)
+            if not framework_path:
+                logger.error(f"Framework not found: {framework_name}")
+                return 1
+            server = create_server(str(framework_path))
+            logger.info(f"Starting MCP server with framework: {framework_name}")
+            server.run()
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to start server with framework '{framework_name}': {e}")
+            return 1
+
+
+# Helpers
+
+
+
+def _detect_default_branch(repo_path: Path) -> str:
+    """Detect the default branch name."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            # refs/remotes/origin/main -> main
+            return result.stdout.strip().split("/")[-1]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    return "main"
+
+
+# Main Entry Point
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create the argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="darnit",
+        description="Declarative compliance auditing for software projects",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        # PyPI distribution name is `darnit-core` (the CLI command stays `darnit`).
+        # Fall back to "dev" when running from a non-installed source checkout
+        # so the CLI never crashes on `--version` just because the package
+        # metadata isn't on the import path.
+        version=f"%(prog)s {_resolve_version()}",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Suppress non-essential output",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # serve command (primary - listed first)
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start MCP server (recommended)",
+        description="Start darnit as an MCP server. This is the recommended way to use darnit "
+                    "as it enables full LLM consultation capabilities for intelligent analysis.\n\n"
+                    "Usage:\n"
+                    "  darnit serve config.toml      # Use TOML config file\n"
+                    "  darnit serve --framework NAME # Use named framework\n"
+                    "  darnit serve                  # Auto-detect framework",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    serve_parser.add_argument(
+        "config",
+        nargs="?",
+        help="Path to TOML config file (e.g., my-framework.toml)",
+    )
+    serve_parser.add_argument(
+        "-f", "--framework",
+        help="Framework to use (default: auto-detect). Ignored if config file is provided.",
+    )
+    serve_parser.set_defaults(func=cmd_serve)
+
+    # audit command (debug)
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="[Debug] Run audit without LLM",
+        description="Run compliance audit in terminal mode. NOTE: This runs without LLM "
+                    "consultation - checks requiring analysis will return WARN/inconclusive. "
+                    "For full capabilities, use 'darnit serve' with an MCP client.",
+    )
+    audit_parser.add_argument(
+        "repo_path",
+        nargs="?",
+        default=".",
+        help="Path to repository (default: current directory)",
+    )
+    audit_parser.add_argument(
+        "-f", "--framework",
+        help="Framework to use (name or path to .toml file)",
+    )
+    audit_parser.add_argument(
+        "-t", "--tags",
+        action="append",
+        default=[],
+        help="Filter controls by attributes (e.g., level=1, domain=VM, security). "
+             "Multiple filters use AND logic. Bare values match tags list.",
+    )
+    audit_parser.add_argument(
+        "--include",
+        help="Include only these control IDs (comma-separated)",
+    )
+    audit_parser.add_argument(
+        "--exclude",
+        help="Exclude these control IDs (comma-separated)",
+    )
+    audit_parser.add_argument(
+        "-o", "--output",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+    audit_parser.add_argument(
+        "--no-fail",
+        action="store_true",
+        help="Don't exit with error code on failures",
+    )
+    audit_parser.add_argument(
+        "--show-all",
+        action="store_true",
+        help="List every check in text output: show all passed checks (no truncation) "
+             "and include N/A checks. Useful for documenting full OSPS Baseline conformance.",
+    )
+    audit_parser.add_argument(
+        "--profile", "-p",
+        dest="profile",
+        default=None,
+        help="Audit profile name to filter controls (e.g., 'level1_quick' or 'openssf-baseline:level1_quick')",
+    )
+    audit_parser.set_defaults(func=cmd_audit)
+
+    # plan command (debug)
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="[Debug] Show execution plan",
+        description="Show what controls would be checked. This is a debug/development command.",
+    )
+    plan_parser.add_argument(
+        "repo_path",
+        nargs="?",
+        default=".",
+        help="Path to repository",
+    )
+    plan_parser.add_argument(
+        "-f", "--framework",
+        help="Framework to use",
+    )
+    plan_parser.add_argument(
+        "-t", "--tags",
+        action="append",
+        default=[],
+        help="Filter controls by attributes (e.g., level=1, domain=VM, security). "
+             "Multiple filters use AND logic. Bare values match tags list.",
+    )
+    plan_parser.add_argument(
+        "--include",
+        help="Include only these control IDs (comma-separated)",
+    )
+    plan_parser.add_argument(
+        "--exclude",
+        help="Exclude these control IDs (comma-separated)",
+    )
+    plan_parser.add_argument(
+        "--profile", "-p",
+        dest="profile",
+        default=None,
+        help="Audit profile name to filter controls",
+    )
+    plan_parser.set_defaults(func=cmd_plan)
+
+    # profiles command
+    profiles_parser = subparsers.add_parser(
+        "profiles",
+        help="List available audit profiles",
+        description="List named audit profiles defined by loaded implementations.",
+    )
+    profiles_parser.add_argument(
+        "--impl",
+        default=None,
+        help="Filter to a specific implementation (e.g., 'openssf-baseline')",
+    )
+    profiles_parser.set_defaults(func=cmd_profiles)
+
+    # validate command
+    validate_parser = subparsers.add_parser("validate", help="Validate framework config")
+    validate_parser.add_argument(
+        "framework_path",
+        help="Path to framework .toml file",
+    )
+    validate_parser.set_defaults(func=cmd_validate)
+
+    # init command
+    init_parser = subparsers.add_parser("init", help="Initialize .baseline.toml")
+    init_parser.add_argument(
+        "repo_path",
+        nargs="?",
+        default=".",
+        help="Path to repository",
+    )
+    init_parser.add_argument(
+        "-f", "--framework",
+        help="Framework to extend (default: auto-detect)",
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing file",
+    )
+    init_parser.set_defaults(func=cmd_init)
+
+    # list command
+    list_parser = subparsers.add_parser("list", help="List available frameworks")
+    list_parser.set_defaults(func=cmd_list)
+
+    # run command (agentic)
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run full agentic workflow (LLM-powered)",
+        description="Run the full autonomous compliance pipeline. "
+                    "Loads project context, runs all checks, collects context, "
+                    "and remediates failures. Requires an LLM API key.",
+    )
+    run_parser.add_argument(
+        "repo_path",
+        nargs="?",
+        default=".",
+        help="Path to repository (default: current directory)",
+    )
+    run_parser.add_argument(
+        "--feedback",
+        dest="feedback_mode",
+        choices=["interactive", "noninteractive", "auto"],
+        default="auto",
+        help="Human feedback mode: interactive (prompts in terminal), "
+             "noninteractive (collects questions for later), "
+             "auto (interactive if terminal, noninteractive in CI)",
+    )
+    run_parser.set_defaults(func=cmd_run)
+
+    # harness command (feature 026)
+    harness_parser = subparsers.add_parser(
+        "harness",
+        help="Run end-to-end audit with in-band LLM dispatch (fleet-operator driver).",
+        description=(
+            "End-to-end audit driver with in-band LLM dispatch. Reads "
+            "ANTHROPIC_API_KEY from env; dispatches LLM steps itself so "
+            "no control ends up PENDING_LLM in the report. Non-interactive; "
+            "batch answers via --answers or auto-discovered .project/project.yaml."
+        ),
+    )
+    harness_parser.add_argument(
+        "repo_path",
+        help="Path to the target repository",
+    )
+    harness_parser.add_argument(
+        "--framework",
+        help="Framework name (e.g., openssf-baseline). Overrides .baseline.toml.",
+    )
+    harness_parser.add_argument(
+        "--level",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help="Maximum maturity level to audit (default: 3)",
+    )
+    harness_parser.add_argument(
+        "--answers",
+        help=(
+            "Path to YAML/JSON file with pre-declared context answers. "
+            "Overrides values in .project/project.yaml for the run."
+        ),
+    )
+    harness_parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Report format (default: markdown)",
+    )
+    harness_parser.add_argument(
+        "--output",
+        help="Write report to this path; without it, stdout carries the report.",
+    )
+    harness_parser.add_argument(
+        "--per-call-timeout",
+        type=int,
+        default=60,
+        help="Per-LLM-call timeout in seconds (default: 60)",
+    )
+    harness_parser.add_argument(
+        "--total-run-timeout",
+        type=int,
+        default=900,
+        help="Total audit-run timeout in seconds (default: 900 = 15 min)",
+    )
+    harness_parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Prompt the operator at the terminal for any pending feedback "
+            "question not covered by --answers or .project/project.yaml. "
+            "Requires stdin to be a TTY and /dev/tty to be openable; fails "
+            "fast with exit 2 otherwise."
+        ),
+    )
+    harness_parser.add_argument(
+        "--per-resolver-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-resolver timeout in seconds. Default: no timeout. "
+            "Setting a global bound is usually inappropriate (an operator at "
+            "a terminal cannot be on the same clock as a webhook resolver)."
+        ),
+    )
+    harness_parser.add_argument(
+        "--allow-external-resolvers",
+        action="store_true",
+        help=(
+            "Include third-party question resolvers registered under the "
+            "`darnit.question_resolvers` entry-point group. Off by default: "
+            "external resolvers produce authority='asserted' values, so "
+            "silently including them would violate Constitution Principle IV "
+            "(only human confirmation may assert)."
+        ),
+    )
+    harness_parser.set_defaults(func=cmd_harness)
+
+    # install command
+    install_parser = subparsers.add_parser(
+        "install",
+        help="Configure MCP server in Claude Code or Cursor",
+    )
+    install_parser.add_argument(
+        "--client",
+        choices=["claude-code", "claude-desktop", "claude", "cursor"],
+        default="claude-code",
+        help="Client to configure (default: claude-code). 'claude' is deprecated — use claude-code or claude-desktop." ,
+    )
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing darnit entry without prompting",
+    )
+    install_parser.add_argument(
+        "--mcp-only",
+        action="store_true",
+        help="Only install MCP server config, skip skills",
+    )
+    install_parser.add_argument(
+        "--project",
+        action="store_true",
+        help="Install skills into .claude/skills/ and MCP config into .mcp.json (per-project) instead of global paths",
+    )
+    install_parser.set_defaults(func=cmd_install)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point for the CLI."""
+    parser = create_parser()
+    args = parser.parse_args(argv)
+
+    # Configure logging
+    if args.verbose:
+        configure_logging(level="DEBUG")
+    elif args.quiet:
+        configure_logging(level="WARNING")
+    else:
+        configure_logging(level="INFO")
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

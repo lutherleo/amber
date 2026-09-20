@@ -1,0 +1,7 @@
+[project]
+name = "fastapi-minimal"
+version = "0.0.1"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn",
+]
