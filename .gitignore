@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# Whitelist .gitignore: the repository tracks ONLY the minimum needed to
+# install and run the darnit project. Everything at the top level is ignored
+# by default; a few paths are re-included below. All local, dev, tooling and
+# generated files stay on disk but remain untracked.
+# ---------------------------------------------------------------------------
+/*
+
+# Re-include the runnable project + build configuration.
+!/.gitignore
+!/.python-version
+!/LICENSE
+!/README.md
+!/pyproject.toml
+!/uv.lock
+!/packages/
+
+# Drop test suites -- the repo carries only code required to run the project.
+# (Note: this matches tests/ DIRECTORIES only; a source module such as
+# darnit/server/tools/test_repository.py is not under a tests/ dir and stays.)
+**/tests/
+
+# Never commit caches, build artifacts or virtualenvs, even inside packages/.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.venv/
+**/build/
+**/dist/

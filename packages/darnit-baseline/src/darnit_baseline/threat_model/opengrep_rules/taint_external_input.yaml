@@ -1,0 +1,58 @@
+rules:
+  - id: darnit.taint.external-input-to-subprocess
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "External input flows to subprocess execution"
+    metadata:
+      category: tampering
+      stride: tampering
+    pattern-sources:
+      - pattern: request.$ANYTHING
+      - pattern: request.query_params
+      - pattern: request.query_params.get(...)
+      - pattern: request.form(...)
+      - pattern: request.json()
+      - pattern: os.environ[...]
+      - pattern: os.environ.get(...)
+      - pattern: sys.argv
+      - pattern: sys.argv[...]
+      - pattern: input(...)
+    pattern-sinks:
+      - pattern: subprocess.run(...)
+      - pattern: subprocess.call(...)
+      - pattern: subprocess.check_call(...)
+      - pattern: subprocess.check_output(...)
+      - pattern: subprocess.Popen(...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+      - pattern: shlex.split(...)
+    pattern-propagators:
+      - pattern: $LIST.append($TAINTED)
+        from: $TAINTED
+        to: $LIST
+      - pattern: $DICT[$K] = $TAINTED
+        from: $TAINTED
+        to: $DICT
+
+  - id: darnit.taint.external-input-to-eval
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: "External input flows to dynamic code execution"
+    metadata:
+      category: elevation_of_privilege
+      stride: elevation_of_privilege
+    pattern-sources:
+      - pattern: request.$ANYTHING
+      - pattern: os.environ[...]
+      - pattern: sys.argv[...]
+      - pattern: input(...)
+    pattern-sinks:
+      - pattern: eval(...)
+      - pattern: exec(...)
+      - pattern: compile(...)
+    pattern-sanitizers:
+      - pattern: ast.literal_eval(...)

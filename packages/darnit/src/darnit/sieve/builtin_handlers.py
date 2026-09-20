@@ -1,0 +1,1492 @@
+"""Built-in sieve handlers for the confidence gradient pipeline.
+
+These handlers implement the core verification logic dispatched
+from TOML HandlerInvocation configs via the SieveHandlerRegistry.
+
+Built-in verification handlers:
+    - file_exists: Check file existence from a list of paths
+    - exec: Run external command, evaluate exit code / CEL expr
+    - regex: Match regex patterns in file content
+    - llm_eval: AI evaluation with confidence threshold
+    - manual_steps: Human verification checklist
+
+Built-in remediation handlers:
+    - file_create: Create a file from a template
+    - api_call: Make an HTTP API call
+    - project_update: Update .project/project.yaml values
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from typing import Any
+
+from darnit.core.error_class import ErrorClass, log_environmental_failure
+
+from .handler_registry import (
+    HandlerContext,
+    HandlerResult,
+    HandlerResultStatus,
+    get_sieve_handler_registry,
+)
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Feature 031: mcp handler constants
+# =============================================================================
+
+MCP_DEFAULT_TIMEOUT_SECONDS: float = 60.0
+"""Per-call timeout for `handler = "mcp"` passes when the pass omits `timeout`.
+
+Spec FR-002 (clarified 2026-08-16). Individual passes MAY override via
+``timeout = <seconds>``. Kept as a module constant so tests can monkeypatch
+it without stubbing the whole handler.
+"""
+
+# =============================================================================
+# Feature 036: environmental-failure classification
+# =============================================================================
+
+# GitHub-only stderr patterns for v0 (clarify Q4). The `exec` handler sees
+# only stdout/stderr/exit-code -- it has no access to response headers -- so
+# classification is substring matching against `gh` CLI stderr shape. Other
+# exec targets (git, curl, syft, cosign) fall through to `network`; per-target
+# pattern packs are a follow-up if real audits show they are needed.
+#
+# Rate-limit is checked BEFORE auth: GitHub answers 403 for both rate limits
+# and permission failures, and the rate-limit body is the more specific signal.
+_GH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
+    "api rate limit exceeded",
+    "secondary rate limit",
+    "abuse detection mechanism",
+)
+
+_GH_AUTH_PATTERNS: tuple[str, ...] = (
+    "http 401",
+    "bad credentials",
+    "requires authentication",
+    "gh auth login",
+    "authentication token",
+)
+
+
+def _classify_exec_failure(stderr: str) -> ErrorClass | None:
+    """Classify a non-zero-exit subprocess failure from its stderr.
+
+    Returns ``None`` when no GitHub v0 pattern matches. This is deliberate
+    (improvement #2): the ``exec`` handler runs many non-``gh`` commands
+    (git, curl, cosign, syft), and an *undeclared* non-zero exit from one of
+    those is frequently a genuine repository finding the TOML author simply
+    did not enumerate in ``fail_exit_codes`` -- not an environment problem.
+    Stamping every such case ``network`` would relabel a real FAIL as "fix
+    your runner," which is the feature's own failure mode inverted and
+    exactly the misleading verdict Constitution Principle II forbids.
+    "We could not determine an environmental cause" is more honest than a
+    confident wrong one.
+
+    Only called on paths where the command did not complete as expected.
+    Callers must NOT invoke this for a declared ``fail_exit_codes`` hit --
+    that is a check that ran and concluded, not an environmental failure.
+    """
+    haystack = (stderr or "").lower()
+    if any(p in haystack for p in _GH_RATE_LIMIT_PATTERNS):
+        return "rate_limit"
+    if any(p in haystack for p in _GH_AUTH_PATTERNS):
+        return "auth"
+    return None
+
+
+def _log_environmental_failure(
+    control_id: str, handler: str, error_class: ErrorClass, message: str
+) -> None:
+    """Thin adapter onto the shared :func:`log_environmental_failure` hub.
+
+    Kept so the existing call sites read unchanged; the formatting and the
+    typed-``error_class`` guard now live in one place (``core.error_class``).
+    """
+    log_environmental_failure(logger, error_class, message, subject=f"{control_id}: {handler}")
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Write ``content`` to ``path`` atomically via tempfile-then-rename.
+
+    Determinism Tier 1 (#418): direct ``open(path, "w").write(content)``
+    leaves a partial file behind if the process crashes or the disk fills
+    mid-write. Tempfile in the same directory + ``os.replace`` gives us
+    the same "either fully written or absent" invariant that
+    :class:`FilesystemAuditCacheStore` uses (feature 033).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".darnit-write-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# =============================================================================
+# Verification Handlers
+# =============================================================================
+
+
+_FILE_DISCOVERY_PRUNE_DIRS = frozenset(
+    {
+        # VCS
+        ".git",
+        ".hg",
+        ".svn",
+        # Python
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "site-packages",
+        # JS/TS
+        "node_modules",
+        # Rust / Go / Java build outputs
+        "target",
+        "build",
+        "dist",
+        "out",
+        # IDE / OS
+        ".idea",
+        ".vscode",
+        ".DS_Store",
+    }
+)
+
+
+def _walk_depth_limited(root: str, max_depth: int):
+    """Yield directories under ``root`` up to ``max_depth`` levels deep.
+
+    Skips well-known noise directories (``.git``, ``node_modules``,
+    ``__pycache__``, build outputs, etc.) so performance stays sane on
+    real monorepos. ``max_depth=0`` yields only ``root`` itself; ``=1``
+    yields root + its immediate subdirs; etc.
+    """
+    root_abs = os.path.abspath(root)
+    yield root_abs, 0
+    if max_depth <= 0:
+        return
+    for dirpath, dirnames, _files in os.walk(root_abs):
+        depth = dirpath[len(root_abs) :].count(os.sep)
+        # Prune in-place so os.walk skips them (matches os.walk's contract).
+        # Sort so os.walk visits subdirs deterministically -- "first match
+        # wins" semantics downstream depend on this. Determinism Tier 1 (#418).
+        dirnames[:] = sorted(d for d in dirnames if d not in _FILE_DISCOVERY_PRUNE_DIRS)
+        if depth >= max_depth:
+            # Don't descend further; stop yielding deeper dirs
+            dirnames.clear()
+            continue
+        for d in dirnames:
+            yield os.path.join(dirpath, d), depth + 1
+
+
+def file_exists_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Check if any file from a list of paths exists.
+
+    Config fields:
+        files: list[str] - File paths/patterns to check (any match = pass)
+        use_locator: bool - If true, files are populated from locator.discover at load time
+        max_depth: int - When > 0, search subdirectories up to this many levels
+            deep for any non-glob pattern in ``files``. Default 0 (root only,
+            backward-compatible). Glob patterns containing ``*`` are NOT
+            depth-walked — they're still evaluated by ``glob.glob`` exactly as
+            before. Well-known noise directories (``.git``, ``node_modules``,
+            ``__pycache__``, build outputs, etc.) are pruned during the walk
+            so monorepo performance stays bounded. Resolves issue #221.
+    """
+    files = config.get("files", [])
+    if not files:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="No files specified for existence check",
+        )
+
+    max_depth = int(config.get("max_depth", 0) or 0)
+
+    for pattern in files:
+        if "*" in pattern:
+            import glob
+
+            # sorted() so "first match wins" is stable across filesystems.
+            # Determinism Tier 1 (#418).
+            matches = sorted(glob.glob(os.path.join(context.local_path, pattern)))
+            if matches:
+                found = matches[0]
+                rel_path = os.path.relpath(found, context.local_path)
+                return HandlerResult(
+                    status=HandlerResultStatus.PASS,
+                    message=f"Required file found: {rel_path}",
+                    confidence=1.0,
+                    evidence={"found_file": found, "relative_path": rel_path, "files_checked": files},
+                )
+        elif max_depth > 0:
+            # Depth-limited search for nested manifests (issue #221). Walks up
+            # to `max_depth` levels under `context.local_path`, pruning noise
+            # directories. First hit wins; we report its relative path so
+            # downstream consumers (and audit reviewers) can see where it
+            # actually lives.
+            for dirpath, _depth in _walk_depth_limited(context.local_path, max_depth):
+                candidate = os.path.join(dirpath, pattern)
+                if os.path.exists(candidate):
+                    rel_path = os.path.relpath(candidate, context.local_path)
+                    return HandlerResult(
+                        status=HandlerResultStatus.PASS,
+                        message=f"Required file found: {rel_path}",
+                        confidence=1.0,
+                        evidence={
+                            "found_file": candidate,
+                            "relative_path": rel_path,
+                            "files_checked": files,
+                            "max_depth": max_depth,
+                        },
+                    )
+        else:
+            path = os.path.join(context.local_path, pattern)
+            if os.path.exists(path):
+                return HandlerResult(
+                    status=HandlerResultStatus.PASS,
+                    message=f"Required file found: {pattern}",
+                    confidence=1.0,
+                    evidence={"found_file": path, "relative_path": pattern, "files_checked": files},
+                )
+
+    return HandlerResult(
+        status=HandlerResultStatus.FAIL,
+        message=f"None of the required files found: {files}",
+        confidence=1.0,
+        evidence={"files_checked": files, "max_depth": max_depth},
+    )
+
+
+def exec_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Run an external command and evaluate the result.
+
+    Config fields:
+        command: list[str] - Command to execute (supports $OWNER, $REPO, $BRANCH, $PATH)
+        pass_exit_codes: list[int] - Exit codes that indicate pass (default: [0])
+        fail_exit_codes: list[int] | None - Exit codes that indicate fail
+        output_format: str - How to parse output ("text", "json")
+        timeout: int - Timeout in seconds (default: 300)
+        env: dict[str, str] - Extra environment variables
+        cwd: str | None - Working directory
+
+    Evidence shape (available in orchestrator ``expr`` as ``output.*``):
+        exit_code: int
+        stdout: str (truncated to 2000 chars)
+        stderr: str (truncated to 500 chars)
+        json: parsed JSON if output is valid JSON, else None
+    """
+    command = config.get("command", [])
+    if not command:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="No command specified for exec handler",
+        )
+
+    pass_exit_codes = config.get("pass_exit_codes", [0])
+    fail_exit_codes = config.get("fail_exit_codes")
+    timeout = config.get("timeout", 300)
+    env_extra = config.get("env", {})
+    cwd = config.get("cwd", context.local_path)
+
+    # Substitute variables in command
+    substitutions = {
+        "$OWNER": context.owner,
+        "$REPO": context.repo,
+        "$BRANCH": context.default_branch,
+        "$PATH": context.local_path,
+    }
+    resolved_cmd = []
+    for arg in command:
+        for var, val in substitutions.items():
+            arg = arg.replace(var, val)
+        resolved_cmd.append(arg)
+
+    # Build environment
+    env = os.environ.copy()
+    env.update(env_extra)
+
+    try:
+        proc = subprocess.run(
+            resolved_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        message = f"Command timed out after {timeout}s: {resolved_cmd[0]}"
+        _log_environmental_failure(context.control_id, "exec", "timeout", message)
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=message,
+            evidence={"command": resolved_cmd, "timeout": timeout},
+            error_class="timeout",
+        )
+    except FileNotFoundError:
+        message = f"Command not found: {resolved_cmd[0]}"
+        _log_environmental_failure(context.control_id, "exec", "not_found", message)
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=message,
+            evidence={"command": resolved_cmd},
+            error_class="not_found",
+        )
+
+    evidence: dict[str, Any] = {
+        "command": resolved_cmd,
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout[:2000] if proc.stdout else "",
+        "stderr": proc.stderr[:2000] if proc.stderr else "",
+    }
+
+    # Parse JSON output if requested
+    output_format = config.get("output_format", "text")
+    if output_format == "json" and proc.stdout:
+        try:
+            import json
+
+            evidence["json"] = json.loads(proc.stdout)
+        except (json.JSONDecodeError, ValueError):
+            logger.debug("Failed to parse JSON output from command")
+
+    # Exit code evaluation
+    if proc.returncode in pass_exit_codes:
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message=f"Command passed (exit code {proc.returncode})",
+            confidence=1.0,
+            evidence=evidence,
+        )
+    elif fail_exit_codes and proc.returncode in fail_exit_codes:
+        # Declared failure code: the check RAN and concluded non-compliance.
+        # No error_class -- this is a real finding, not an environment problem.
+        return HandlerResult(
+            status=HandlerResultStatus.FAIL,
+            message=f"Command failed (exit code {proc.returncode})",
+            confidence=1.0,
+            evidence=evidence,
+        )
+    else:
+        # Undeclared exit code: we cannot tell whether the check concluded.
+        # Classify from the FULL stderr (improvement #1) -- ``evidence["stderr"]``
+        # is truncated to 2000 chars, and a rate-limit / auth signal past that
+        # boundary would otherwise be missed and silently mislabelled.
+        error_class = _classify_exec_failure(proc.stderr or "")
+        message = f"Command exited with unexpected code {proc.returncode}"
+        if error_class is not None:
+            _log_environmental_failure(context.control_id, "exec", error_class, message)
+        else:
+            # No environmental cause identified. Still WARN (an undeclared exit
+            # is worth surfacing) but carry NO error_class -- see #2.
+            logger.warning(
+                "%s: exec exited %d with unrecognized stderr "
+                "(error_class unclassified): %s",
+                context.control_id,
+                proc.returncode,
+                message,
+            )
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message=message,
+            evidence=evidence,
+            error_class=error_class,
+        )
+
+
+def regex_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Match regex patterns in file content.
+
+    Supports two config formats:
+
+    **Legacy (singular)**::
+
+        file: str - Single file path (supports $FOUND_FILE from evidence)
+        pattern: str - Single regex pattern
+
+    **TOML multi-file/multi-pattern**::
+
+        files: list[str] - File paths/globs to search
+        pattern: dict - With nested ``patterns`` dict of named regexes
+        pass_if_any: bool - True = PASS if ANY file×pattern matches (default: true)
+
+    **Exclude mode** (returns evidence for CEL evaluation)::
+
+        exclude_files: list[str] - Globs to check for presence
+
+    Common fields:
+        min_matches: int - Minimum matches per pattern per file (default: 1)
+        max_depth: int - When > 0, walk subdirectories up to this many levels
+            deep when resolving non-glob ``files`` entries or ``exclude_files``
+            patterns that contain no wildcards. Default 0 (root only,
+            backward-compatible). Glob patterns containing ``*`` are still
+            evaluated by ``glob.glob`` exactly as before. Well-known noise
+            directories (``.git``, ``node_modules``, ``__pycache__``, build
+            outputs, etc.) are pruned during the walk so monorepo performance
+            stays bounded.
+
+    Evidence shape (available in orchestrator ``expr`` as ``output.*``):
+        any_match: bool - True if any pattern matched in any file
+        files_checked: int - Number of files examined
+        results: list[dict] - Per-file match details
+        patterns_checked: list[str] - Pattern names checked
+        resolved_files: list[str] - (match mode) absolute paths of files
+            that existed on disk and were scanned. A downstream
+            ``llm_eval`` pass automatically falls back to this list when
+            ``files_to_include`` produces no content (issue #402).
+        files_found: int - (exclude mode) number of files matching globs
+        found_files: list[str] - (exclude mode) matched file paths
+    """
+    # --- Exclude mode: glob files and return evidence (CEL does pass/fail) ---
+    max_depth = int(config.get("max_depth", 0) or 0)
+    exclude_files = config.get("exclude_files", [])
+    if exclude_files:
+        return _regex_exclude_evidence(exclude_files, context, max_depth)
+
+    # --- Resolve file list ---
+    file_paths = _resolve_regex_files(config, context, max_depth)
+    if file_paths is None:
+        # Error result already determined
+        return _regex_no_files_result(config, context)
+
+    # --- Resolve patterns ---
+    patterns = _resolve_regex_patterns(config)
+    if not patterns:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="Missing pattern for regex handler",
+        )
+
+    # --- Match patterns across files ---
+    min_matches = config.get("min_matches", 1)
+    pass_if_any = config.get("pass_if_any", True)
+
+    return _regex_match_files(
+        file_paths,
+        patterns,
+        min_matches,
+        pass_if_any,
+    )
+
+
+def _regex_exclude_evidence(
+    exclude_globs: list[str],
+    context: HandlerContext,
+    max_depth: int = 0,
+) -> HandlerResult:
+    """Glob for excluded files and return evidence. CEL ``expr`` decides pass/fail.
+
+    When ``max_depth > 0``, plain filename patterns (no ``*``/``?``) are
+    resolved with a depth-bounded walk instead of only checking the root.
+    Glob patterns are always passed to ``glob.glob`` unchanged.
+    """
+    import glob as globmod
+
+    found: list[str] = []
+    for pattern in exclude_globs:
+        if "*" in pattern or "?" in pattern:
+            matches = globmod.glob(
+                os.path.join(context.local_path, pattern),
+                recursive=True,
+            )
+            found.extend(matches)
+        elif max_depth > 0:
+            # Depth-limited walk for plain filenames (no wildcards).
+            # dirs.clear() at the boundary depth means directory entries AT
+            # that depth are no longer descended into; only files at each
+            # visited dir are matched here.
+            for dirpath, _d in _walk_depth_limited(context.local_path, max_depth):
+                candidate = os.path.join(dirpath, pattern)
+                if os.path.exists(candidate):
+                    found.append(candidate)
+        else:
+            candidate = os.path.join(context.local_path, pattern)
+            if os.path.exists(candidate):
+                found.append(candidate)
+
+    rel_paths = [os.path.relpath(f, context.local_path) for f in found[:10]]
+    evidence = {
+        "exclude_globs": exclude_globs,
+        "files_found": len(found),
+        "found_files": rel_paths,
+    }
+    # Return PASS with evidence — if an expr is present the orchestrator
+    # will override based on the CEL result (e.g. 'output.files_found == 0').
+    # When no expr is present, finding zero files is the common success case.
+    if not found:
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message="No excluded files found",
+            confidence=1.0,
+            evidence=evidence,
+        )
+    return HandlerResult(
+        status=HandlerResultStatus.FAIL,
+        message=f"Found {len(found)} excluded file(s): {', '.join(rel_paths[:5])}",
+        confidence=1.0,
+        evidence=evidence,
+    )
+
+
+def _resolve_regex_files(
+    config: dict[str, Any],
+    context: HandlerContext,
+    max_depth: int = 0,
+) -> list[str] | None:
+    """Resolve the list of absolute file paths to search.
+
+    Returns a list of absolute paths, or None if no files could be resolved.
+
+    When ``max_depth > 0``, plain filename entries in ``files`` (those without
+    ``*`` or ``?``) are resolved with a depth-bounded walk via
+    ``_walk_depth_limited`` so nested manifests like ``src/app/config.yml``
+    are discovered. Glob patterns are always passed to ``glob.glob`` unchanged
+    to preserve existing behavior bit-for-bit for non-opt-in controls.
+    """
+    import glob as globmod
+
+    # Multi-file format: files = ["README.md", "*.yml"]
+    files_list = config.get("files", [])
+    if files_list:
+        resolved: list[str] = []
+        for file_pattern in files_list:
+            if "*" in file_pattern or "?" in file_pattern:
+                # Glob patterns: always use glob.glob; max_depth does not apply.
+                # sorted() so downstream ordering is stable across filesystems.
+                # Determinism Tier 1 (#418).
+                matches = sorted(
+                    globmod.glob(
+                        os.path.join(context.local_path, file_pattern),
+                        recursive=True,
+                    )
+                )
+                resolved.extend(m for m in matches if os.path.isfile(m))
+            elif max_depth > 0:
+                # Depth-limited walk for plain filenames (no wildcards).
+                # Only files are collected; dirs.clear() at the depth boundary
+                # prevents descending further without skipping files at that depth.
+                for dirpath, _d in _walk_depth_limited(context.local_path, max_depth):
+                    candidate = os.path.join(dirpath, file_pattern)
+                    if os.path.isfile(candidate):
+                        resolved.append(candidate)
+            else:
+                full = os.path.join(context.local_path, file_pattern)
+                if os.path.isfile(full):
+                    resolved.append(full)
+        return resolved if resolved else None
+
+    # Legacy singular format: file = "README.md" or file = "$FOUND_FILE"
+    file_path = config.get("file", "")
+    if not file_path:
+        return None
+
+    if file_path == "$FOUND_FILE":
+        file_path = context.gathered_evidence.get("found_file", "")
+        if not file_path:
+            return None
+
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(context.local_path, file_path)
+
+    if os.path.isfile(file_path):
+        return [file_path]
+    return None
+
+
+def _regex_no_files_result(
+    config: dict[str, Any],
+    context: HandlerContext,
+) -> HandlerResult:
+    """Return the appropriate result when no files could be resolved."""
+    file_path = config.get("file", "")
+    if file_path == "$FOUND_FILE" and not context.gathered_evidence.get("found_file"):
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="$FOUND_FILE referenced but no file found in evidence",
+        )
+
+    files_list = config.get("files", [])
+    if files_list:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message=f"No files found matching: {files_list}",
+            evidence={"files_checked": files_list},
+        )
+
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message="Missing file or pattern for regex handler",
+    )
+
+
+def _resolve_regex_patterns(config: dict[str, Any]) -> dict[str, str]:
+    """Resolve patterns from config into a name→regex dict.
+
+    Supports:
+    - pattern: str → {"pattern": str}
+    - pattern: {patterns: {name: regex, ...}} → {name: regex, ...}
+    """
+    raw = config.get("pattern", "")
+
+    if isinstance(raw, str) and raw:
+        return {"pattern": raw}
+
+    if isinstance(raw, dict):
+        nested = raw.get("patterns", {})
+        if isinstance(nested, dict) and nested:
+            return dict(nested)
+
+    return {}
+
+
+def _regex_match_files(
+    file_paths: list[str],
+    patterns: dict[str, str],
+    min_matches: int,
+    pass_if_any: bool,
+) -> HandlerResult:
+    """Match patterns across files and return a result."""
+    all_results: list[dict[str, Any]] = []
+    any_match = False
+
+    for fpath in file_paths:
+        try:
+            with open(fpath, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError:
+            continue
+
+        for pname, pregex in patterns.items():
+            matches = re.findall(pregex, content, re.MULTILINE | re.IGNORECASE)
+            match_count = len(matches)
+            matched = match_count >= min_matches
+
+            all_results.append(
+                {
+                    "file": fpath,
+                    "pattern_name": pname,
+                    "pattern": pregex,
+                    "match_count": match_count,
+                    "matched": matched,
+                    "matches_preview": matches[:3],
+                }
+            )
+
+            if matched:
+                any_match = True
+
+    evidence: dict[str, Any] = {
+        "files_checked": len(file_paths),
+        "patterns_checked": list(patterns.keys()),
+        "results": all_results[:20],
+        "any_match": any_match,
+        # Issue #402 Option 2: paths of files that actually existed on
+        # disk and were scanned. A downstream `llm_eval` pass can fall
+        # back to this list when `$FOUND_FILE` is empty (e.g.
+        # `pattern -> llm_eval` shapes with no `file_exists` sibling),
+        # avoiding the empty-file_contents bug documented in #402. Absolute
+        # paths -- llm_eval accepts either shape (see llm_eval_handler).
+        "resolved_files": list(file_paths),
+    }
+
+    if pass_if_any:
+        if any_match:
+            return HandlerResult(
+                status=HandlerResultStatus.PASS,
+                message=f"Pattern matched in {sum(1 for r in all_results if r['matched'])} result(s)",
+                confidence=0.8,
+                evidence=evidence,
+            )
+        return HandlerResult(
+            status=HandlerResultStatus.FAIL,
+            message="Pattern not found in any file",
+            confidence=0.7,
+            evidence=evidence,
+        )
+
+    # pass_if_any=False: ALL pattern×file combos must match
+    all_matched = all(r["matched"] for r in all_results) if all_results else False
+    if all_matched:
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message=f"All {len(all_results)} pattern checks matched",
+            confidence=0.8,
+            evidence=evidence,
+        )
+    failed = [r for r in all_results if not r["matched"]]
+    return HandlerResult(
+        status=HandlerResultStatus.FAIL,
+        message=f"{len(failed)} of {len(all_results)} pattern checks failed",
+        confidence=0.7,
+        evidence=evidence,
+    )
+
+
+def llm_eval_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Request LLM evaluation with confidence threshold.
+
+    Config fields:
+        prompt: str - Prompt for LLM evaluation
+        confidence_threshold: float - Minimum confidence to accept (default: 0.8)
+        analysis_hints: list[str] - Hints for the LLM
+        files_to_include: list[str] - Files whose contents to bundle with
+            the consultation. Supports:
+            - literal paths (relative to repo root or absolute)
+            - ``"$FOUND_FILE"`` -> `gathered_evidence["found_file"]` (from
+              a preceding `file_exists` PASS)
+            - ``"$RESOLVED_FILES"`` -> `gathered_evidence["resolved_files"]`
+              (list from a preceding `regex`/`pattern` pass). Fans out to
+              multiple candidates from a single sentinel (issue #402).
+            Missing files are silently skipped. Capped at 5 file contents
+            total; each capped at 10000 bytes.
+
+            When `files_to_include` produces no file contents at all
+            (empty $FOUND_FILE, missing literal paths, and no
+            $RESOLVED_FILES sentinel), the handler automatically falls
+            back to `gathered_evidence["resolved_files"]` so a
+            `pattern -> llm_eval` shape without a `file_exists` sibling
+            never ships an empty consultation (issue #402).
+
+    Note: This handler returns INCONCLUSIVE with a consultation request in the details,
+    since actual LLM invocation happens at the MCP server level.
+    """
+    prompt = config.get("prompt", "")
+    if not prompt:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="No prompt specified for LLM evaluation",
+        )
+
+    # Resolve files_to_include: read file contents for LLM context.
+    # Supported sentinels:
+    #   $FOUND_FILE      -> gathered_evidence["found_file"] (from file_exists)
+    #   $RESOLVED_FILES  -> gathered_evidence["resolved_files"] (from regex/pattern; issue #402)
+    # Literal paths are opened directly; missing files are silently skipped.
+    files_to_include = config.get("files_to_include", [])
+    file_contents: dict[str, str] = {}
+
+    def _read(resolved: str) -> None:
+        if not resolved or len(file_contents) >= 5:
+            return
+        full = os.path.join(context.local_path, resolved) if not os.path.isabs(resolved) else resolved
+        try:
+            with open(full, encoding="utf-8", errors="ignore") as fh:
+                rel = os.path.relpath(full, context.local_path)
+                file_contents[rel] = fh.read()[:10000]
+        except OSError:
+            pass
+
+    for f in files_to_include[:5]:
+        if f == "$FOUND_FILE":
+            _read(context.gathered_evidence.get("found_file", ""))
+        elif f == "$RESOLVED_FILES":
+            for candidate in context.gathered_evidence.get("resolved_files", []) or []:
+                _read(candidate)
+        else:
+            _read(f)
+
+    # Issue #402 Option 2: automatic fallback for TOMLs that still ship
+    # `files_to_include = ["$FOUND_FILE"]` and no `file_exists` sibling.
+    # If nothing above resolved to real content, try `resolved_files` from
+    # the preceding regex/pattern pass. Preserves single-source-of-truth
+    # for the file list (the sibling pattern already declares it).
+    if not file_contents:
+        for candidate in context.gathered_evidence.get("resolved_files", []) or []:
+            _read(candidate)
+
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message="LLM consultation requested",
+        details={
+            "consultation_request": {
+                "prompt": prompt,
+                "control_id": context.control_id,
+                "confidence_threshold": config.get("confidence_threshold", 0.8),
+                "analysis_hints": config.get("analysis_hints", []),
+                "gathered_evidence": context.gathered_evidence,
+                "file_contents": file_contents,
+            },
+        },
+    )
+
+
+def llm_extract_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """LLM-backed EXTRACTION step (feature 025 T045).
+
+    Unlike ``llm_eval`` which asks the LLM to make a pass/fail judgment,
+    ``llm_extract`` asks the LLM to extract a VALUE from repository content
+    (e.g., "propose a security contact by scanning README and docs").
+
+    Registration default_authority is ``suggestive`` (T009 migration table):
+    the extracted value is a proposal for human confirmation, never authority
+    for concluding a control. This matches the RFC's Constitution Principle IV
+    (never conclude a user-judgment value from code alone).
+
+    Config fields:
+        prompt: str - Prompt describing what to extract
+        files: list[str] - Glob patterns for content to include
+        target_key: str - Optional context key the extraction targets (for
+            downstream Collect confirmation matching)
+
+    Returns INCONCLUSIVE with a structured `extraction_request` payload in
+    ``details``; the actual LLM call is dispatched via the LLMStep protocol
+    at a later phase (Slice D T047 + downstream drivers). Attaches the
+    prompt + gathered content to evidence for provenance.
+    """
+    import glob as globmod
+
+    prompt = config.get("prompt", "")
+    if not prompt:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="No prompt specified for llm_extract",
+        )
+
+    # Resolve files to include (bounded).
+    globs = config.get("files", [])
+    file_contents: dict[str, str] = {}
+    for pattern in globs[:5]:  # cap breadth
+        matches = globmod.glob(
+            os.path.join(context.local_path, pattern),
+            recursive=True,
+        )
+        for m in matches[:5]:  # cap depth per glob
+            try:
+                with open(m, encoding="utf-8", errors="ignore") as fh:
+                    rel = os.path.relpath(m, context.local_path)
+                    file_contents[rel] = fh.read()[:10000]
+            except OSError:
+                continue
+
+    # Feature 026: also emit `consultation_request` so the sieve's
+    # PENDING_LLM branch triggers when a driver runs with stop_on_llm=True.
+    # This makes llm_extract a first-class participant in the harness's
+    # LLM dispatch loop (research.md R1) -- same shape llm_eval uses.
+    # `extraction_request` is kept for backward-compat with existing tests.
+    consultation_payload = {
+        "prompt": prompt,
+        "control_id": context.control_id,
+        "target_key": config.get("target_key"),
+        "file_contents": file_contents,
+        "gathered_evidence": context.gathered_evidence,
+    }
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message=f"LLM extraction requested for control {context.control_id}",
+        evidence={
+            "llm_extract_prompt": prompt,
+            "llm_extract_files_gathered": sorted(file_contents.keys()),
+        },
+        details={
+            "extraction_request": consultation_payload,
+            "consultation_request": consultation_payload,
+        },
+    )
+
+
+def manual_steps_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Provide manual verification steps for human review.
+
+    Config fields:
+        steps: list[str] - Human-readable verification steps
+    """
+    steps = config.get("steps", ["Verify this control manually"])
+
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message="Manual verification required",
+        evidence={"verification_steps": steps},
+        details={"verification_steps": steps},
+    )
+
+
+# =============================================================================
+# Remediation Handlers
+# =============================================================================
+
+
+def file_create_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Create a file from a template or content.
+
+    Config fields:
+        path: str - Destination file path (relative to repo)
+        template: str - Template name to use (looked up from framework templates)
+        content: str - Direct content (used if template not specified)
+        overwrite: bool - Whether to overwrite existing files (default: false)
+    """
+    path = config.get("path", "")
+    if not path:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="No path specified for file creation",
+        )
+
+    full_path = os.path.join(context.local_path, path)
+
+    if os.path.exists(full_path) and not config.get("overwrite", False):
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message=f"File already exists: {path}",
+            evidence={"path": path, "action": "skipped"},
+        )
+
+    content = config.get("content", "")
+    if not content:
+        # Template resolution would happen at a higher level
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=f"No content or template for file creation: {path}",
+            evidence={"path": path},
+        )
+
+    try:
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        _atomic_write_text(full_path, content)
+    except OSError as e:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message=f"Failed to create file: {e}",
+            evidence={"path": path, "error": str(e)},
+        )
+
+    return HandlerResult(
+        status=HandlerResultStatus.PASS,
+        message=f"Created file: {path}",
+        confidence=1.0,
+        evidence={"path": path, "action": "created"},
+    )
+
+
+def api_call_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Make an HTTP API call for remediation.
+
+    Config fields:
+        method: str - HTTP method (default: "PUT")
+        url: str - URL to call (supports $OWNER, $REPO, $BRANCH)
+        payload: dict | str - Request body
+        headers: dict[str, str] - Request headers
+    """
+    url = config.get("url", "")
+    if not url:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="No URL specified for API call",
+        )
+
+    # Substitute variables
+    substitutions = {
+        "$OWNER": context.owner,
+        "$REPO": context.repo,
+        "$BRANCH": context.default_branch,
+    }
+    for var, val in substitutions.items():
+        url = url.replace(var, val)
+
+    return HandlerResult(
+        status=HandlerResultStatus.INCONCLUSIVE,
+        message=f"API call to {url} requires execution context",
+        evidence={"url": url, "method": config.get("method", "PUT")},
+        details={"requires_execution": True},
+    )
+
+
+def project_update_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Update .project/project.yaml values.
+
+    Config fields:
+        updates: dict[str, Any] - Dotted path → value pairs to set
+    """
+    updates = config.get("updates", {})
+    if not updates:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message="No updates specified for project_update handler",
+        )
+
+    return HandlerResult(
+        status=HandlerResultStatus.PASS,
+        message=f"Project update queued: {list(updates.keys())}",
+        evidence={"updates": updates},
+        details={"project_updates": updates},
+    )
+
+
+def yaml_inject_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Inject a top-level key into YAML files that lack it.
+
+    Designed for safe, idempotent additions — e.g., adding `permissions: {}`
+    to GitHub Actions workflows. Only modifies files that are missing the key.
+
+    Config fields:
+        files: str - Glob pattern for YAML files (relative to repo)
+        key: str - The top-level key to inject (e.g., "permissions")
+        value: str - The YAML value to inject (e.g., "{}")
+        insert_after: str - Insert after this key (e.g., "on"). If not found,
+            inserts at the top of the file after any leading comments.
+    """
+    import glob as glob_mod
+
+    files_pattern = config.get("files", "")
+    key = config.get("key", "")
+    value = config.get("value", "{}")
+    insert_after = config.get("insert_after", "on")
+
+    if not files_pattern or not key:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="yaml_inject requires 'files' and 'key' config fields",
+        )
+
+    pattern = os.path.join(context.local_path, files_pattern)
+    matched_files = glob_mod.glob(pattern)
+    if not matched_files:
+        return HandlerResult(
+            status=HandlerResultStatus.INCONCLUSIVE,
+            message=f"No files matched pattern: {files_pattern}",
+            evidence={"pattern": files_pattern},
+        )
+
+    import re
+
+    modified = []
+    skipped = []
+    for filepath in matched_files:
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            continue
+
+        # Skip if key already exists at the top level (not indented)
+        if re.search(rf"^{re.escape(key)}\s*:", content, re.MULTILINE):
+            skipped.append(os.path.relpath(filepath, context.local_path))
+            continue
+
+        # Find insertion point: after the insert_after key's block
+        lines = content.split("\n")
+        insert_idx = 0
+        in_target_block = False
+        for i, line in enumerate(lines):
+            if re.match(rf"^{re.escape(insert_after)}\s*:", line):
+                in_target_block = True
+                continue
+            if in_target_block:
+                # End of block: next top-level key or blank line after content
+                if line and not line[0].isspace() and not line.startswith("#"):
+                    insert_idx = i
+                    break
+                if not line.strip() and i > 0 and lines[i - 1].strip():
+                    insert_idx = i + 1
+                    break
+        else:
+            if in_target_block:
+                insert_idx = len(lines)
+
+        injection = f"\n{key}: {value}\n"
+        lines.insert(insert_idx, injection.rstrip())
+
+        try:
+            _atomic_write_text(filepath, "\n".join(lines))
+            modified.append(os.path.relpath(filepath, context.local_path))
+        except OSError:
+            continue
+
+    if not modified:
+        return HandlerResult(
+            status=HandlerResultStatus.PASS,
+            message=f"All {len(skipped)} file(s) already have '{key}:'",
+            evidence={"skipped": skipped},
+        )
+
+    return HandlerResult(
+        status=HandlerResultStatus.PASS,
+        message=f"Injected '{key}: {value}' into {len(modified)} file(s)",
+        confidence=1.0,
+        evidence={"modified": modified, "skipped": skipped},
+    )
+
+
+# =============================================================================
+# Feature 031: mcp handler
+# =============================================================================
+
+
+def _classify_mcp_exception(
+    err: Exception, *, optional: bool
+) -> tuple[HandlerResultStatus, ErrorClass, str]:
+    """Map a pool exception to ``(status, error_class, message)`` in one table.
+
+    Replaces the eight-arm ``except`` chain in :func:`mcp_handler` (#6). The
+    two independent decisions -- how the pass resolves (status) and why it
+    could not complete (error_class) -- are now visible side by side and
+    unit-testable per row, and the ``optional`` lookup happens once instead
+    of being repeated in four arms. Ordering mirrors the original chain so
+    any subclass relationships resolve identically. The five rows beyond
+    FR-006's three named types are the contract's documented extensions
+    (research.md R-007).
+    """
+    from .mcp_pool import (
+        McpServerBinaryMissing,
+        McpServerHandshakeFailed,
+        McpServerUnusable,
+        McpServerVerificationFailed,
+        McpToolError,
+        McpToolResponseNotJson,
+        McpToolTimeout,
+        UnknownMcpServer,
+    )
+
+    E = HandlerResultStatus.ERROR
+    # optional server -> INCONCLUSIVE (skip it); required server -> FAIL.
+    opt = HandlerResultStatus.INCONCLUSIVE if optional else HandlerResultStatus.FAIL
+
+    table: tuple[tuple[type, HandlerResultStatus, ErrorClass], ...] = (
+        (UnknownMcpServer, E, "not_found"),
+        (McpServerBinaryMissing, opt, "not_found"),
+        (McpServerVerificationFailed, E, "auth"),
+        (McpServerHandshakeFailed, opt, "network"),
+        (McpServerUnusable, opt, "network"),
+        (McpToolTimeout, E, "timeout"),
+        (McpToolError, E, "crashed"),
+        (McpToolResponseNotJson, E, "crashed"),
+    )
+    for exc_cls, status, error_class in table:
+        if isinstance(err, exc_cls):
+            # Preserve the original "required binary" phrasing for that one case.
+            if exc_cls is McpServerBinaryMissing and not optional:
+                return status, error_class, f"Required MCP server binary not found. {err}"
+            return status, error_class, str(err)
+
+    # Final safety net: anything the pool did not classify is a crash.
+    return E, "crashed", f"MCP handler unexpected error: {type(err).__name__}: {err}"
+
+
+def mcp_handler(config: dict[str, Any], context: HandlerContext) -> HandlerResult:
+    """Call a tool on an allowlisted MCP server and evaluate ``expr`` over ``result.*``.
+
+    Config fields:
+        server: Name of an allowlisted ``[mcp_servers.<name>]`` block.
+        tool: Name of the tool to invoke on that server.
+        args: Dict of tool arguments; ``$OWNER``, ``$REPO``, ``$BRANCH``,
+            and ``$PATH`` placeholders in string values are substituted
+            from the ``HandlerContext``.
+        expr: Optional CEL expression evaluated over ``{"result": <response>}``.
+            When absent, PASS iff the tool returned successfully.
+        timeout: Optional per-call timeout override in seconds. Defaults
+            to :data:`MCP_DEFAULT_TIMEOUT_SECONDS`.
+
+    Emits :class:`HandlerResult` per the failure-mode table in
+    ``docs/architecture/feature-031/mcp-handler-contract.md``. Does NOT
+    emit the ``dispatching_mcp`` progress line -- the orchestrator's
+    dispatch site owns that so ``[N/M]`` counter state is available.
+    """
+    server_name = config.get("server")
+    tool_name = config.get("tool")
+    args = dict(config.get("args") or {})
+    expr = config.get("expr")
+    timeout = float(config.get("timeout", MCP_DEFAULT_TIMEOUT_SECONDS))
+
+    if not isinstance(server_name, str) or not server_name:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="mcp handler pass missing 'server' field",
+        )
+    if not isinstance(tool_name, str) or not tool_name:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="mcp handler pass missing 'tool' field",
+        )
+
+    pool = context.mcp_pool
+    if pool is None:
+        return HandlerResult(
+            status=HandlerResultStatus.ERROR,
+            message="mcp handler invoked without pool wiring (internal error)",
+        )
+
+    server_config = _lookup_mcp_server(context, server_name)
+    substituted_args = _substitute_mcp_args(args, context)
+
+    import time as _time
+
+    call_start = _time.time()
+    error_info: tuple[HandlerResultStatus, str, ErrorClass] | None = None
+    raw_response: dict[str, Any] | None = None
+    trust_label: str
+
+    try:
+        raw_response = pool.call_tool(server_name, tool_name, substituted_args, timeout)
+    except Exception as err:  # noqa: BLE001 - all pool failures routed through the table
+        # ``optional`` is looked up ONCE here (was repeated in four except arms).
+        optional = True
+        if server_config is not None:
+            optional = bool(getattr(server_config, "optional", True))
+        status, error_class, message = _classify_mcp_exception(err, optional=optional)
+        error_info = (status, message, error_class)
+
+    elapsed_ms = int((_time.time() - call_start) * 1000)
+
+    if server_config is not None:
+        trust_label = (
+            "sigstore-verified"
+            if getattr(server_config, "trusted_publisher", None)
+            else "operator-trusted-path"
+        )
+    else:
+        trust_label = "operator-trusted-path"
+
+    session = pool._sessions.get(server_name) if hasattr(pool, "_sessions") else None
+    if session is not None:
+        trust_label = session.trust_label
+
+    if error_info is not None:
+        status, message, error_class = error_info
+        _log_environmental_failure(
+            context.control_id, f"mcp:{server_name}.{tool_name}", error_class, message
+        )
+        invocation_record = {
+            "server": server_name,
+            "tool": tool_name,
+            "args_after_substitution": substituted_args,
+            "error": message,
+            "trust_label": trust_label,
+            "elapsed_ms": elapsed_ms,
+        }
+        evidence: dict[str, Any] = {"mcp_calls": [invocation_record]}
+        return HandlerResult(
+            status=status,
+            message=message,
+            evidence=evidence,
+            error_class=error_class,
+        )
+
+    assert raw_response is not None
+    invocation_record = {
+        "server": server_name,
+        "tool": tool_name,
+        "args_after_substitution": substituted_args,
+        "raw_response": raw_response,
+        "trust_label": trust_label,
+        "elapsed_ms": elapsed_ms,
+    }
+    evidence = {"mcp_calls": [invocation_record], "result": raw_response}
+
+    if expr:
+        cel_ok, cel_value, cel_error = _eval_cel_over_result(expr, raw_response)
+        if not cel_ok:
+            return HandlerResult(
+                status=HandlerResultStatus.ERROR,
+                message=f"MCP expr evaluation failed: {cel_error}",
+                evidence=evidence,
+            )
+        if cel_value:
+            return HandlerResult(
+                status=HandlerResultStatus.PASS,
+                message=f"MCP {server_name}.{tool_name} expr matched",
+                confidence=1.0,
+                evidence=evidence,
+            )
+        return HandlerResult(
+            status=HandlerResultStatus.FAIL,
+            message=f"MCP {server_name}.{tool_name} expr did not match",
+            evidence=evidence,
+        )
+
+    # No expr -> presence of a successful tool response is PASS.
+    return HandlerResult(
+        status=HandlerResultStatus.PASS,
+        message=f"MCP {server_name}.{tool_name} returned successfully",
+        confidence=1.0,
+        evidence=evidence,
+    )
+
+
+def _lookup_mcp_server(context: HandlerContext, server_name: str) -> Any | None:
+    """Return the ``McpServerConfig`` for ``server_name`` on the exec context, if any."""
+    execution_context = context.execution_context
+    if execution_context is None:
+        return None
+    servers = getattr(execution_context, "mcp_servers", None)
+    if not isinstance(servers, dict):
+        return None
+    return servers.get(server_name)
+
+
+def _substitute_mcp_args(args: dict[str, Any], context: HandlerContext) -> dict[str, Any]:
+    """Substitute ``$OWNER``/``$REPO``/``$BRANCH``/``$PATH`` in string values.
+
+    Feature 033 T005: uses :func:`darnit.core.env_subst.substitute_dollar_vars`
+    with ``missing="leave"`` semantics so unknown ``$VAR`` tokens in the
+    template are preserved as-is (matches the previous
+    ``_apply_replacements`` behavior). Only the four context-derived
+    tokens are substituted.
+    """
+    from darnit.core.env_subst import substitute_dollar_vars
+
+    replacements = {
+        "OWNER": context.owner or "",
+        "REPO": context.repo or "",
+        "BRANCH": context.default_branch or "main",
+        "PATH": context.local_path or "",
+    }
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            out[key] = substitute_dollar_vars(value, replacements, missing="leave")
+        else:
+            out[key] = value
+    return out
+
+
+def _eval_cel_over_result(
+    expr: str, raw_response: dict[str, Any]
+) -> tuple[bool, Any, str | None]:
+    """Evaluate ``expr`` against ``{"result": raw_response}``.
+
+    Returns ``(ok, value, error)``. ``ok=False`` means evaluation itself
+    failed (surface as ERROR); ``ok=True`` means it produced a value that
+    the caller interprets as truthy/falsy.
+    """
+    try:
+        from .cel_evaluator import evaluate_cel
+    except Exception as err:  # noqa: BLE001 - CEL evaluator import surprise
+        return False, None, f"CEL evaluator unavailable: {err}"
+
+    cel_result = evaluate_cel(expr, {"result": raw_response})
+    if not cel_result.success:
+        return False, None, str(cel_result.error)
+    return True, cel_result.value, None
+
+
+# =============================================================================
+# Registration
+# =============================================================================
+
+
+def register_builtin_handlers() -> None:
+    """Register all built-in sieve handlers with the global registry.
+
+    Default authority per handler (RFC-0001 Stage 1, feature 025 T009): see
+    ``specs/025-rfc0001-stage1/data-model.md`` section 2. `dispositive` for
+    handlers that observe ground truth; `suggestive` for LLM-backed handlers;
+    `asserted` for manual/confirmation handlers.
+    """
+    registry = get_sieve_handler_registry()
+
+    # Verification handlers
+    registry.register(
+        "file_exists",
+        phase="deterministic",
+        handler_fn=file_exists_handler,
+        description="Check file existence from a list of paths",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "exec",
+        phase="deterministic",
+        handler_fn=exec_handler,
+        description="Run external command, evaluate exit code / CEL expr",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "regex",
+        phase="pattern",
+        handler_fn=regex_handler,
+        description="Match regex patterns in file content",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "pattern",
+        phase="pattern",
+        handler_fn=regex_handler,
+        description="Alias for regex handler (match regex patterns in file content)",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "llm_eval",
+        phase="llm",
+        handler_fn=llm_eval_handler,
+        description="AI evaluation with confidence threshold",
+        default_authority="suggestive",
+    )
+    # RFC-0001 Stage 1 (feature 025 T045): llm_extract for value extraction.
+    # Same suggestive-only authority as llm_eval; never concludes a control.
+    registry.register(
+        "llm_extract",
+        phase="llm",
+        handler_fn=llm_extract_handler,
+        description="LLM-backed value extraction (suggestive; never concludes a control)",
+        default_authority="suggestive",
+    )
+    registry.register(
+        "manual_steps",
+        phase="manual",
+        handler_fn=manual_steps_handler,
+        description="Human verification checklist",
+        default_authority="asserted",
+    )
+    registry.register(
+        "manual",
+        phase="manual",
+        handler_fn=manual_steps_handler,
+        description="Alias for manual_steps handler (human verification checklist)",
+        default_authority="asserted",
+    )
+    # Feature 031: external MCP server as observation source. Dispositive
+    # because the tool observes ground truth (a real subprocess reports
+    # its state); the trust label separately surfaces whether the binary
+    # was Sigstore-verified or operator-trusted-on-PATH.
+    registry.register(
+        "mcp",
+        phase="deterministic",
+        handler_fn=mcp_handler,
+        description="Call a tool on an external MCP server; evaluate CEL over result.*",
+        default_authority="dispositive",
+    )
+
+    # Remediation handlers
+    registry.register(
+        "file_create",
+        phase="deterministic",
+        handler_fn=file_create_handler,
+        description="Create a file from a template or content",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "api_call",
+        phase="deterministic",
+        handler_fn=api_call_handler,
+        description="Make an HTTP API call",
+        default_authority="dispositive",
+    )
+    registry.register(
+        "project_update",
+        phase="deterministic",
+        handler_fn=project_update_handler,
+        description="Update .project/project.yaml values",
+        default_authority="asserted",  # writes user-confirmed values
+    )
+    registry.register(
+        "yaml_inject",
+        phase="deterministic",
+        handler_fn=yaml_inject_handler,
+        description="Inject a top-level key into YAML files that lack it",
+        default_authority="dispositive",
+    )

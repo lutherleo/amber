@@ -1,0 +1,39 @@
+rules:
+  - id: darnit.taint.config-to-subprocess
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: "Config file content flows to subprocess execution"
+    metadata:
+      category: tampering
+      stride: tampering
+    pattern-sources:
+      - pattern: tomllib.load(...)
+      - pattern: tomli.load(...)
+      - pattern: toml.load(...)
+      - pattern: yaml.safe_load(...)
+      - pattern: yaml.load(...)
+      - pattern: json.load(...)
+    pattern-sinks:
+      - pattern: subprocess.run(...)
+      - pattern: subprocess.call(...)
+      - pattern: subprocess.Popen(...)
+      - pattern: os.system(...)
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+
+  - id: darnit.taint.config-to-eval
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    message: "Config file content flows to dynamic code execution"
+    metadata:
+      category: elevation_of_privilege
+      stride: elevation_of_privilege
+    pattern-sources:
+      - pattern: yaml.load(...)
+      - pattern: json.load(...)
+      - pattern: toml.load(...)
+    pattern-sinks:
+      - pattern: eval(...)
+      - pattern: exec(...)

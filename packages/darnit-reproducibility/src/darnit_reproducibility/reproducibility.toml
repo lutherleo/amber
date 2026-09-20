@@ -1,0 +1,247 @@
+[metadata]
+schema_version = "0.1.0-alpha"
+name = "reproducibility"
+display_name = "Scientific Reproducibility Checks"
+version = "0.1.0"
+spec_version = "0.1.0"
+description = "Checks that builds are reproducible and verifiable"
+
+[mcp]
+name = "reproducibility"
+description = "Run scientific reproducibility checks on a repository"
+
+[mcp.tools.audit_reproducibility]
+builtin = "audit"
+description = "Run reproducibility checks"
+
+# =============================================================================
+# Control: Are dependencies pinned to exact versions?
+# Unpinned deps mean two builds on different days can produce different results.
+# =============================================================================
+
+[controls."RE-01.01"]
+name = "DependenciesPinned"
+description = "Dependencies are pinned to exact versions with checksums"
+tags = { level = 1, domain = "RE" }
+
+[[controls."RE-01.01".passes]]
+handler = "repro_deps_pinned"
+
+[[controls."RE-01.01".passes]]
+handler = "manual"
+steps = [
+    "Check that dependency files pin exact versions (not ranges like >=1.0)",
+    "For Python: verify uv.lock or requirements.txt has exact versions",
+    "For Node: verify package-lock.json or yarn.lock exists",
+    "For Rust: verify Cargo.lock is committed",
+    "For Go: verify go.sum exists and is committed",
+]
+
+[controls."RE-01.01".remediation]
+safe = true
+dry_run_supported = true
+
+# `uv lock` is Python-specific, so the remediation is gated to Python projects
+# via `when = { detected_ecosystem = "python" }`; on non-Python projects it is
+# simply not applicable, keeping the safe = true claim accurate where it runs.
+# TODO: add per-language remediations (cargo update, go mod tidy, ...).
+[[controls."RE-01.01".remediation.handlers]]
+handler = "exec"
+when = { detected_ecosystem = "python" }
+command = ["uv", "lock"]
+dry_run_command = ["uv", "lock", "--dry-run"]
+
+# =============================================================================
+# Control: Is the build environment declared?
+# A build that works on "my machine" but nowhere else is not reproducible.
+# =============================================================================
+
+[controls."RE-01.02"]
+name = "BuildEnvDeclared"
+description = "Build environment is explicitly declared"
+tags = { level = 1, domain = "RE" }
+
+[[controls."RE-01.02".passes]]
+handler = "repro_build_env_declared"
+
+[[controls."RE-01.02".passes]]
+handler = "manual"
+steps = [
+    "Check for one of: Dockerfile, flake.nix, .devcontainer/, Vagrantfile",
+    "Verify it pins the base OS and tool versions",
+    "Confirm the declared environment is actually used in CI",
+]
+
+# =============================================================================
+# Control: Does the build avoid network access?
+# A hermetic build fetches nothing at build time — all deps come from the
+# lock file. Network access during build = non-reproducible.
+# =============================================================================
+
+# v0.2 heuristic: scans .github/workflows, composite actions (.github/actions/*/),
+# non-GitHub CI (GitLab CI, CircleCI, Jenkins, Azure Pipelines, Drone, Buildkite),
+# Makefiles, build scripts (scripts/build*, scripts/install*, etc.), and
+# Dockerfiles/Containerfiles.  Strips comments before pattern matching to cut FPs.
+# System-package installs (apt-get, apk, yum) inside Dockerfiles are DEFERRED —
+# building the image environment is acceptable; app-dep fetches at build time are not.
+# Strong signals (Witness runtime attestation, Nix flake CI, Bazel network sandbox)
+# short-circuit to PASS.  A clean grep alone returns INCONCLUSIVE — grep absence is
+# not proof of hermeticity.  Roadmap: https://github.com/kusari-oss/darnit/issues/227
+[controls."RE-02.01"]
+name = "HermeticBuild"
+description = "Build does not fetch dependencies at build time"
+tags = { level = 2, domain = "RE" }
+depends_on = ["RE-01.02"]  # Nix flake strong signal is gated on BuildEnvDeclared having confirmed it
+
+# verify_witness_attestations (bool, default true): fetches and Sigstore-verifies
+# Witness/runtime-trace attestation artifacts from the repo's latest CI run via
+# `gh`. Set to false to skip that network round-trip entirely (air-gapped
+# audits, or repos with no usable `gh` login) — falls back to the CI-text/Nix/
+# Bazel signals below it. See witness_attestation.py for details.
+[[controls."RE-02.01".passes]]
+handler = "repro_hermetic_build"
+
+[[controls."RE-02.01".passes]]
+handler = "manual"
+steps = [
+    "Review all CI files (GitHub Actions, GitLab CI, CircleCI, Jenkinsfile, etc.) for network-fetch commands during build",
+    "Review Makefiles, build scripts (scripts/build*, scripts/install*), and Dockerfiles for the same",
+    "Check for curl, wget, pip install (without --no-index), npm install (without --ci), brew install in build steps",
+    "Verify all dependencies come from the lock file, not fetched live at build time",
+    "For a PASS without a strong signal, confirm via Witness attestation, Nix flake build, or Bazel network sandbox",
+]
+
+# =============================================================================
+# Control: Does a provenance attestation exist?
+# Provenance = a signed record of what went into the build.
+# SLSA level 2+ requires this.
+# =============================================================================
+
+[controls."RE-02.02"]
+name = "ProvenanceExists"
+description = "Build produces a signed provenance attestation"
+tags = { level = 2, domain = "RE" }
+
+[[controls."RE-02.02".passes]]
+handler = "repro_provenance_exists"
+
+[[controls."RE-02.02".passes]]
+handler = "manual"
+steps = [
+    "Check CI workflow for sigstore/cosign signing steps",
+    "Look for .intoto.jsonl or attestation files in releases",
+    "Verify SLSA provenance is generated (slsa-github-generator or equivalent)",
+]
+
+# =============================================================================
+# Control: Is the build byte-for-byte reproducible?
+# Two independent builds of the same commit should produce identical output.
+# =============================================================================
+
+[controls."RE-03.01"]
+name = "BitForBitReproducible"
+description = "Build output is identical across independent builds"
+tags = { level = 3, domain = "RE" }
+
+[[controls."RE-03.01".passes]]
+handler = "repro_bit_for_bit"
+
+[[controls."RE-03.01".passes]]
+handler = "manual"
+steps = [
+    "Run the build twice and compare checksums of output artifacts",
+    "Check reprotest or diffoscope output if available",
+    "Look for timestamps or random seeds embedded in build output",
+    "Verify SOURCE_DATE_EPOCH is set in CI to normalize timestamps",
+]
+
+# =============================================================================
+# Control: Was the run's execution captured as verifiable runtime provenance?
+# Amber captures system + folder state + git + the Python library objects a run
+# actually loaded (hashed), producing a Witness collection bundle. `amber capture`.
+# =============================================================================
+
+[controls."RE-01.03"]
+name = "RuntimeProvenanceCaptured"
+description = "The run's execution was captured as verifiable runtime provenance (Amber)"
+tags = { level = 1, domain = "RE" }
+
+[[controls."RE-01.03".passes]]
+handler = "repro_runtime_provenance"
+
+[[controls."RE-01.03".passes]]
+handler = "manual"
+steps = [
+    "Run the experiment under `amber capture -- <command>` to produce a bundle",
+    "Confirm the bundle records the git commit, the loaded library objects, and their digests",
+    "Store the bundle in the repo (e.g. .amber/bundle.json) so it can be verified later",
+]
+
+# =============================================================================
+# Control: Is the Go module fully pinned? (Go-aware companion to RE-01.01/03.01)
+# Credits go.mod's pinned `go`/`toolchain` version, the go.sum checksum lock,
+# vendoring, and reproducible-build flags (-trimpath, -mod=readonly) that the
+# language-agnostic checks miss. Only applies to Go projects.
+# =============================================================================
+
+[controls."RE-01.04"]
+name = "GoModulePinned"
+description = "Go module is fully pinned (toolchain + checksummed dependencies)"
+tags = { level = 1, domain = "RE" }
+
+[[controls."RE-01.04".passes]]
+handler = "repro_go_module_pinned"
+when = { detected_ecosystem = "go" }
+
+[[controls."RE-01.04".passes]]
+handler = "manual"
+when = { detected_ecosystem = "go" }
+steps = [
+    "Verify go.mod pins a `go <version>` (and ideally a `toolchain`) directive",
+    "Verify go.sum is committed (module checksums) or the repo vendors modules",
+    "For reproducible binaries, confirm the build uses `-trimpath` (e.g. in .goreleaser.yml)",
+]
+
+# =============================================================================
+# Control: Do the captured run's used dependencies have known vulnerabilities?
+# `amber vulns` cross-checks the used distributions against OSV.dev. A reproducible
+# result built on a vulnerable library is still a supply-chain risk.
+# =============================================================================
+
+[controls."RE-02.03"]
+name = "CapturedDepsNoKnownVulns"
+description = "The captured run's used dependencies have no known vulnerabilities (OSV)"
+tags = { level = 2, domain = "RE" }
+
+# check_osv (bool, default true): set false to skip the OSV.dev network round-trip (air-gapped audits).
+[[controls."RE-02.03".passes]]
+handler = "repro_deps_no_known_vulns"
+
+[[controls."RE-02.03".passes]]
+handler = "manual"
+steps = [
+    "Run `amber vulns .amber/bundle.json` to cross-check used deps against OSV.dev",
+    "Confirm no used distribution has an open advisory; upgrade any that do",
+]
+
+# =============================================================================
+# Control: Has the run been independently verified as reproducible?
+# `amber verify <original> <reproduction>` emits a reproducibility verdict
+# attestation; this control passes when that verdict shows a reproduction.
+# =============================================================================
+
+[controls."RE-03.02"]
+name = "ReproVerified"
+description = "The build/run has been independently verified as reproducible (Amber)"
+tags = { level = 3, domain = "RE" }
+
+[[controls."RE-03.02".passes]]
+handler = "repro_verified"
+
+[[controls."RE-03.02".passes]]
+handler = "manual"
+steps = [
+    "Regenerate the environment from the capture (`amber generate`) and re-run it",
+    "Compare the two captures (`amber verify`) to produce a reproducibility verdict",
+    "Store the verdict attestation (.../attestations/reproducibility/v1) in the repo",
+]

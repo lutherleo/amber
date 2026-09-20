@@ -1,0 +1,98 @@
+[project]
+# PyPI distribution name. The Python import path is still `darnit` (under
+# packages/darnit/src/darnit/) and the CLI command is still `darnit`. Only
+# the PyPI distribution name is `darnit-core`, to avoid a conflict with a
+# similarly-named project on PyPI.
+name = "darnit-core"
+version = "0.1.0"
+description = "Generic compliance audit framework with plugin architecture"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Kusari", email = "info@kusari.dev" },
+]
+keywords = ["security", "compliance", "audit", "framework", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "mcp>=1.23.0,<2",  # CVE-2025-66416 DNS rebinding fix; cap at next major
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    "pydantic[email]>=2.0.0",
+    "ruamel.yaml>=0.18.0",  # For .project/ round-trip YAML parsing
+    "jinja2>=3.1.0",  # Template rendering for remediation files
+    "cel-python>=0.5.0",  # CEL expression evaluation for pass logic
+    "tomli>=2.0.0;python_version<'3.11'",
+    "tomllib-stubs>=0.1.0;python_version<'3.11'",
+    # RFC-0001 Stage 1 (feature 025): default LLMStep implementation. Required
+    # runtime dependency; LLM-assisted checks are core product functionality
+    # and there is no shipping "no-LLM" install tier. Swappable at code time
+    # via the LLMStep Protocol (single-file replacement), not via install flag.
+    "pydantic-ai-slim[anthropic]>=0.0.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/kusari-oss/darnit"
+Repository = "https://github.com/kusari-oss/darnit"
+Issues = "https://github.com/kusari-oss/darnit/issues"
+
+[project.scripts]
+darnit = "darnit.cli:main"
+
+[project.entry-points."darnit.frameworks"]
+# Framework plugins register here
+# Example: openssf-baseline = "darnit_baseline:get_framework_path"
+
+[project.entry-points."darnit.question_resolvers"]
+# Feature 027: QuestionResolver plugins register here. Entry-point declarations
+# are LAZY -- Python only loads the target module when a caller invokes
+# `importlib.metadata.entry_points(group=...).load()`. Missing / broken entry
+# points are logged and skipped at discovery time, never crash the harness.
+interactive_terminal = "darnit.harness.interactive_resolver:build"
+
+# Feature 034: outside-repo filesystem store backends. Both `local-fs` (arbitrary
+# root path via TOML config) and `user-local` (platform-conventional root, XDG /
+# Apple / LOCALAPPDATA) ship in darnit-core alongside the in-repo defaults.
+# `user-local` is deliberately NOT registered under `darnit.stores.project` per
+# FR-009: `.project/project.yaml` must stay in the repo.
+[project.entry-points."darnit.stores.attestation"]
+local-fs = "darnit.stores.defaults.local_fs:LocalFsAttestationStore"
+user-local = "darnit.stores.defaults.user_local:UserLocalAttestationStore"
+
+[project.entry-points."darnit.stores.report"]
+local-fs = "darnit.stores.defaults.local_fs:LocalFsReportStore"
+user-local = "darnit.stores.defaults.user_local:UserLocalReportStore"
+
+[project.entry-points."darnit.stores.cache"]
+local-fs = "darnit.stores.defaults.local_fs:LocalFsAuditCacheStore"
+user-local = "darnit.stores.defaults.user_local:UserLocalAuditCacheStore"
+
+# NOTE: `user-local` is deliberately NOT registered under
+# `darnit.stores.project` per FR-009 -- `.project/project.yaml` stays
+# in the repo. `[stores.project] backend = "user-local"` MUST raise
+# `StoreNotInstalled` at `resolve_stores` time.
+
+[project.optional-dependencies]
+attestation = [
+    "sigstore>=3.0.0",
+    "in-toto-attestation>=0.9.0",
+    "urllib3>=2.6.3,<3",  # CVE-2025-66471, CVE-2026-21441, CVE-2025-66418 fixes
+    "cryptography>=46.0.6,<48",  # CVE-2026-34073 DNS name constraint bypass
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/darnit"]
