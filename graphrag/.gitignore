@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Secrets / local env (commit .env.example, never .env)
+.env
+
+# Orion run artifacts
+.orion/
+*.log
+
+# Test fixtures (large / externally sourced)
+fixtures/
+
+# Curated scan evidence for reviewers — must survive `git clone`, so never ignore it
+# (overrides the *.log rule above for report logs kept under examples/).
+!examples/
+!examples/**

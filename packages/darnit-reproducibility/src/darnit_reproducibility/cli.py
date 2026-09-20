@@ -28,6 +28,7 @@ commands:
   vulns       cross-check the used dependencies against OSV.dev
   provenance  detect locally-patched (vs stock PyPI) library builds
   eval        score capture completeness against ground truth (dev/CI)
+  research    research shell: lock a paper artifact into a verifiable state (graph + verify + ask)
 
 run `amber <command> -h` for command options.
 """
@@ -63,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         return run(rest)
     if cmd == "eval":
         from .evaluation import main as run
+        return run(rest)
+    if cmd == "research":
+        from .research.cli import main as run
         return run(rest)
 
     sys.stderr.write(f"amber: unknown command {cmd!r}\n\n{_USAGE}")

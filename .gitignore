@@ -1,32 +1,41 @@
 # ---------------------------------------------------------------------------
-# Whitelist .gitignore: the repository tracks ONLY the minimum needed to
-# install and run the darnit project. Everything at the top level is ignored
-# by default; a few paths are re-included below. All local, dev, tooling and
-# generated files stay on disk but remain untracked.
+# The repo tracks the project + its tests. Only local, generated, and
+# assistant-tooling files are ignored.
 # ---------------------------------------------------------------------------
-/*
 
-# Re-include the runnable project + build configuration.
-!/.gitignore
-!/.python-version
-!/LICENSE
-!/README.md
-!/pyproject.toml
-!/uv.lock
-!/packages/
+# Virtualenvs
+.venv/
+**/.venv/
 
-# Drop test suites -- the repo carries only code required to run the project.
-# (Note: this matches tests/ DIRECTORIES only; a source module such as
-# darnit/server/tools/test_repository.py is not under a tests/ dir and stays.)
-**/tests/
-
-# Never commit caches, build artifacts or virtualenvs, even inside packages/.
+# Python caches / build artifacts
 **/__pycache__/
 **/*.py[cod]
 **/*.egg-info/
+.eggs/
+/build/
+/dist/
+
+# Tool caches
 **/.pytest_cache/
 **/.ruff_cache/
 **/.mypy_cache/
-**/.venv/
-**/build/
-**/dist/
+.coverage
+htmlcov/
+
+# Assistant / coding-agent tooling files — not part of the project.
+# (The orion scanning agent's own CODE under graphrag/orion/ is kept; only the
+#  assistant-instruction and client-config files are ignored.)
+.claude/
+**/CLAUDE.md
+.mcp.json
+
+# Spec-kit tooling scaffolding (the specs/ content itself is kept)
+.specify/
+
+# Amber per-project research workspaces (local run state)
+.amber-research/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp

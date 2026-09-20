@@ -1,0 +1,255 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Restrict permissions to minimum required (least privilege)
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  UV_VERSION: "0.5.0"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -m unit -v --tb=short
+
+      - name: Run integration tests
+        run: uv run pytest tests/ -m integration -v --tb=short
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # Ruff linting - catches unused imports, variables, and common issues
+      - name: Run ruff linter
+        run: uv run ruff check . --output-format=github
+
+      - name: Run ruff formatter check
+        run: uv run ruff format --check --diff .
+        continue-on-error: true  # Don't fail CI on formatting yet
+
+      - name: Check Python syntax
+        run: |
+          uv run python -m py_compile packages/darnit/src/darnit/__init__.py
+          uv run python -m py_compile packages/darnit-baseline/src/darnit_baseline/__init__.py
+
+      - name: Verify imports work
+        run: |
+          uv run python -c "from darnit.core.discovery import discover_implementations; print(discover_implementations())"
+          uv run python -c "from darnit_baseline import register; print(register())"
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Install mypy
+        run: uv pip install mypy
+
+      - name: Run mypy on core modules
+        run: |
+          uv run mypy packages/darnit/src/darnit/core/models.py --ignore-missing-imports || true
+          uv run mypy packages/darnit/src/darnit/core/plugin.py --ignore-missing-imports || true
+        continue-on-error: true  # Don't fail CI on type errors yet
+
+      # Critical: Check for parameter name mismatches in tool wrappers
+      # This catches bugs like passing 'repo_path' when function expects 'local_path'
+      - name: Check tools.py for call-arg errors
+        run: |
+          uv run mypy packages/darnit-baseline/src/darnit_baseline/tools.py \
+            --ignore-missing-imports \
+            --no-error-summary \
+            --show-error-codes 2>&1 | grep -E "call-arg|arg-type" && exit 1 || exit 0
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Build packages
+        run: |
+          uv build --package darnit-core
+          uv build --package darnit-baseline
+
+      - name: Verify package contents
+        run: |
+          ls -la dist/
+          ls dist/*.whl dist/*.tar.gz
+
+  sync-check:
+    name: Spec-Implementation Sync
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Validate spec-implementation sync
+        run: uv run python scripts/validate_sync.py --verbose
+
+  # T065: integration check for the third-party plugin packaging story.
+  # darnit-hello is the worked example referenced by docs/packaging-plugins.md;
+  # if this job ever fails, the documented packaging path is broken.
+  plugin_discovery_smoke:
+    name: Plugin discovery smoke (darnit-hello)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install workspace (includes darnit-hello)
+        run: uv sync --all-extras
+
+      - name: darnit-hello is discoverable on the darnit.implementations entry point
+        run: |
+          uv run python <<'PY'
+          import sys
+          from importlib.metadata import entry_points
+          eps = list(entry_points(group="darnit.implementations"))
+          names = sorted(ep.name for ep in eps)
+          print(f"Discovered implementations: {names}")
+          assert "hello" in names, (
+              "darnit-hello is not discoverable — the third-party plugin "
+              "packaging guide (docs/packaging-plugins.md) is broken. "
+              f"Found: {names}"
+          )
+          PY
+
+      - name: HelloImplementation satisfies the ComplianceImplementation protocol
+        run: |
+          uv run python <<'PY'
+          from darnit.core.plugin import ComplianceImplementation
+          from darnit_hello import register, get_framework_path
+
+          impl = register()
+          assert isinstance(impl, ComplianceImplementation), (
+              "HelloImplementation does not satisfy the ComplianceImplementation "
+              "protocol — the packaging guide's protocol example is wrong."
+          )
+          assert impl.name == "hello", f"impl.name = {impl.name!r}, expected 'hello'"
+          assert impl.version == "0.1.0"
+          assert impl.get_framework_config_path() == get_framework_path()
+          assert impl.get_framework_config_path().exists(), (
+              f"TOML config not found at {impl.get_framework_config_path()}"
+          )
+          print(f"✓ {impl.display_name} {impl.version} — protocol-conforming")
+          PY
+
+      - name: TOML config defines exactly the documented controls
+        run: |
+          uv run python <<'PY'
+          import tomllib
+          from darnit_hello import get_framework_path
+
+          with open(get_framework_path(), "rb") as f:
+              config = tomllib.load(f)
+          controls = list((config.get("controls") or {}).keys())
+          print(f"Defined controls: {controls}")
+          assert controls == ["HELLO-01.01"], (
+              f"darnit-hello drifted: expected exactly [HELLO-01.01], got {controls}. "
+              "Update the worked example AND docs/packaging-plugins.md together."
+          )
+          PY

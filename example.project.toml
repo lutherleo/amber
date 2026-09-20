@@ -1,0 +1,205 @@
+# =============================================================================
+# project.toml - Project Configuration (Defined Schema)
+# =============================================================================
+#
+# This file is a USER-MAINTAINED configuration file with a defined schema.
+# Copy this to your repository as `project.toml`.
+#
+# ALLOWED CONTENTS:
+#   - Project metadata (name, type, description)
+#   - File location pointers (paths to docs like SECURITY.md, LICENSE)
+#   - Control overrides with human-provided reasoning
+#   - CI/CD configuration references
+#
+# NEVER PUT IN THIS FILE:
+#   - Audit results or compliance scores
+#   - Pass/fail lists or control status
+#   - Timestamps or run metadata
+#   - Auto-generated evidence
+#
+# THE GOLDEN RULE:
+#   project.toml changes when YOU change something about your project.
+#   project.toml does NOT change when an audit runs.
+#
+# =============================================================================
+
+schema_version = "0.1"
+
+[project]
+name = "my-project"
+type = "software"  # software | specification | documentation | infrastructure | data
+description = "A brief description of this project"
+
+# Control overrides - mark specific controls as N/A with reasoning
+[project.controls]
+# Example: No SBOM for this project
+"OSPS-BR-02.01" = { status = "n/a", reason = "Internal tool with no distributable artifacts" }
+
+# User-confirmed project context
+# These are facts about your project that affect how controls are evaluated.
+# The audit tool may prompt you to confirm these if it can't determine them automatically.
+[project.context]
+# Does this project have subprojects or related repositories? (affects OSPS-QA-04.01, OSPS-QA-04.02)
+# has_subprojects = false
+
+# Does this project make official releases? (affects many BR and DO controls)
+# has_releases = true
+
+# Is this a library/framework consumed by other projects? (affects interface docs requirements)
+# is_library = false
+
+# Does this project have compiled/binary release assets? (affects SBOM requirements)
+# has_compiled_assets = false
+
+# What CI/CD system does this project use? (affects OSPS-BR-01.*, OSPS-AC-04.*, OSPS-QA-06.01)
+# Options: "github", "gitlab", "jenkins", "circleci", "azure", "travis", "none", "other"
+# If not using GitHub Actions, set this so CI-related controls can be properly evaluated.
+# ci_provider = "github"
+
+# Security documentation
+[security]
+# Local file reference
+policy = { path = "SECURITY.md" }
+
+# Can also reference external URLs
+# policy = { url = "https://example.com/security-policy" }
+
+# Or another repository
+# policy = { repo = "myorg/.github", path = "SECURITY.md" }
+
+# Threat model documentation
+threat_model = { path = "docs/THREAT_MODEL.md" }
+
+# Security advisories (often a URL)
+advisories = { url = "https://github.com/myorg/myproject/security/advisories" }
+
+# Section references - point to a heading within another file
+# Format: { section = "section.key#heading" } or { section = "path#heading" }
+vex_policy = { section = "security.policy#vex-policy" }
+sca_policy = { section = "security.policy#dependency-vulnerabilities" }
+sast_policy = { section = "security.policy#static-analysis" }
+
+# Standalone secrets management policy
+secrets_policy = { path = "docs/SECRETS.md" }
+
+# Governance documentation
+[governance]
+maintainers = { path = "MAINTAINERS.md" }
+contributing = { path = "CONTRIBUTING.md" }
+code_of_conduct = { path = "CODE_OF_CONDUCT.md" }
+codeowners = { path = ".github/CODEOWNERS" }
+governance_doc = { path = "GOVERNANCE.md" }
+
+# Legal documentation
+[legal]
+license = { path = "LICENSE" }
+# Contributor agreement type
+contributor_agreement = { type = "dco" }  # dco | cla | none
+# For CLA, can include URL
+# contributor_agreement = { type = "cla", url = "https://cla.example.com" }
+
+# Build artifacts
+[artifacts]
+# SBOM location
+sbom = { path = "sbom.json", format = "cyclonedx" }
+# Or mark as N/A
+# sbom = { status = "n/a", reason = "Specification project" }
+
+# Release signing configuration
+signing = { enabled = true, method = "sigstore" }
+
+# Provenance attestations
+provenance = { enabled = true, format = "slsa" }
+
+# Quality documentation
+[quality]
+changelog = { path = "CHANGELOG.md" }
+# Can also be a URL to releases page
+# changelog = { url = "https://github.com/myorg/myproject/releases" }
+
+# Project documentation
+[documentation]
+readme = { path = "README.md" }
+support = { path = "SUPPORT.md" }
+architecture = { path = "docs/ARCHITECTURE.md" }
+api = { path = "docs/API.md" }
+
+# Dependency tracking
+[dependencies]
+lockfile = { path = "uv.lock" }
+manifest = { path = "pyproject.toml" }
+docs = { path = "DEPENDENCIES.md" }
+# Alternative lock files:
+# lockfile = { path = "package-lock.json" }
+# lockfile = { path = "Cargo.lock" }
+# lockfile = { path = "go.sum" }
+
+# Testing documentation and configuration
+[testing]
+# Section reference to testing docs within CONTRIBUTING.md
+docs = { section = "governance.contributing#testing" }
+requirements = { section = "governance.contributing#test-requirements" }
+# Or standalone testing docs
+# docs = { path = "docs/TESTING.md" }
+
+# Release documentation and verification
+[releases]
+docs = { path = "docs/RELEASING.md" }
+# Section references for verification policies
+verification = { section = "security.policy#release-verification" }
+author_verification = { section = "security.policy#author-verification" }
+
+# CI/CD configuration
+[ci]
+provider = "github"  # github | gitlab | circleci | jenkins | travis | azure
+
+# GitHub-specific CI configuration
+# All values are file paths that serve as "proof" of each capability
+# Uses capability-based naming (not tool-specific) for portability
+[ci.github]
+# All workflow files discovered in the repository
+workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/codeql.yml"]
+
+# Contributor verification - DCO or CLA enforcement (maps to OSPS-LE-01.01)
+# Path to the config or workflow file that enforces contributor agreements
+contributor_verification = ".github/dco.yml"
+contributor_verification_type = "dco"  # "dco" or "cla"
+# For CLA: contributor_verification = ".github/workflows/cla.yml"
+
+# Testing - paths to workflows that run automated tests (maps to OSPS-QA-06.01)
+testing = [".github/workflows/ci.yml"]
+
+# Code quality - paths to workflows that run linting/formatting checks
+code_quality = [".github/workflows/ci.yml"]
+
+# Security scanning - paths to workflows that perform SAST/security scans (maps to OSPS-QA-04)
+security_scanning = [".github/workflows/codeql.yml"]
+
+# Dependency management - automated dependency updates and scanning (maps to OSPS-VM-05)
+# Path to config file (dependabot.yml, renovate.json, etc.) and ecosystems covered
+dependency_management = ".github/dependabot.yml"
+dependency_ecosystems = ["npm", "pip", "docker"]
+
+# Release automation - path to release/publish workflow
+release_automation = ".github/workflows/release.yml"
+
+# Branch protection settings (runtime config - declares desired state)
+# These are GitHub API settings, not files
+[ci.github.branch_protection]
+branch = "main"
+required_approvals = 1
+required_checks = ["test", "lint", "CodeQL"]
+enforce_admins = true
+dismiss_stale_reviews = true
+require_code_owner_reviews = true
+
+# For non-GitHub CI, use:
+# [ci]
+# provider = "jenkins"
+# provider_config = "Jenkinsfile"
+# url = "https://jenkins.example.com/job/my-project"
+#
+# [ci]
+# provider = "gitlab"
+# provider_config = ".gitlab-ci.yml"
+# url = "https://gitlab.example.com/myorg/myproject/-/pipelines"

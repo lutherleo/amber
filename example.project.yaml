@@ -1,0 +1,174 @@
+# .project.yaml - CNCF Project Configuration
+# https://github.com/cncf/automation/tree/main/utilities/dot-project
+#
+# OpenSSF Baseline extension: x-openssf-baseline
+# https://baseline.openssf.org/
+
+# =============================================================================
+# CNCF Standard Fields
+# =============================================================================
+
+name: my-project
+description: A brief description of this project
+schema_version: "1.0"
+type: software  # software | specification | documentation | infrastructure | data
+
+# CNCF Maturity Tracking (required for CNCF projects, optional otherwise)
+# maturity_log:
+#   - phase: sandbox
+#     date: 2024-01-15
+#     issue: https://github.com/cncf/toc/issues/123
+#   - phase: incubating
+#     date: 2024-06-01
+#     issue: https://github.com/cncf/toc/issues/456
+
+# Repository references
+repositories:
+  - https://github.com/myorg/my-project
+  - https://github.com/myorg/my-project-docs
+
+# Project presence
+website: https://my-project.io
+# artwork: https://github.com/cncf/artwork/tree/main/projects/myproject
+
+# Community channels
+social:
+  twitter: https://twitter.com/myproject
+  slack: https://slack.myproject.io
+  # youtube: https://youtube.com/@myproject
+
+mailing_lists:
+  - dev@my-project.io
+  - users@my-project.io
+
+# Security documentation (CNCF standard)
+security:
+  policy:
+    path: SECURITY.md
+  threat_model:
+    path: docs/THREAT_MODEL.md
+  contact: security@my-project.io
+
+# Governance documentation (CNCF standard)
+governance:
+  contributing:
+    path: CONTRIBUTING.md
+  codeowners:
+    path: .github/CODEOWNERS
+  governance_doc:
+    path: GOVERNANCE.md
+  # gitvote_config:
+  #   path: .gitvote.yml
+
+# Legal documentation (CNCF standard)
+legal:
+  license:
+    path: LICENSE
+
+# Project documentation (CNCF standard)
+documentation:
+  readme:
+    path: README.md
+  support:
+    path: SUPPORT.md
+  architecture:
+    path: docs/ARCHITECTURE.md
+  api:
+    path: docs/API.md
+
+# Security audits (CNCF standard - useful for compliance!)
+audits:
+  - date: 2024-06-15
+    type: security
+    url: https://example.com/audit-report.pdf
+
+# =============================================================================
+# OpenSSF Baseline Extension (x-openssf-baseline)
+# =============================================================================
+#
+# This extension provides fields for OpenSSF Baseline compliance that are
+# not (yet) part of the CNCF .project standard.
+#
+# THE GOLDEN RULE:
+#   .project.yaml changes when YOU change something about your project.
+#   .project.yaml does NOT change when an audit runs.
+
+x-openssf-baseline:
+  # Extension metadata
+  version: "1.0"
+  osps_version: v2025.10.10
+
+  # Control overrides - mark specific controls as N/A with reasoning
+  # These are human decisions that explain why a control doesn't apply
+  controls:
+    OSPS-BR-02.01:
+      status: n/a
+      reason: Internal tool with no distributable artifacts
+    # OSPS-BR-03.01:
+    #   status: n/a
+    #   reason: Specification project - no releases to sign
+
+  # User-confirmed project context
+  # These affect how controls are evaluated
+  context:
+    has_subprojects: false
+    has_releases: true
+    is_library: false
+    has_compiled_assets: false
+    ci_provider: github
+
+  # Extended governance (not in CNCF spec yet - will propose upstream)
+  governance:
+    maintainers:
+      path: MAINTAINERS.md
+    code_of_conduct:
+      path: CODE_OF_CONDUCT.md
+
+  # Quality tracking
+  quality:
+    changelog:
+      path: CHANGELOG.md
+
+  # Security advisories and policies
+  security:
+    advisories: https://github.com/myorg/my-project/security/advisories
+    # secrets_policy:
+    #   path: docs/SECRETS.md
+
+  # Contributor licensing
+  legal:
+    contributor_agreement:
+      type: dco  # dco | cla | none
+      # url: https://developercertificate.org/
+
+  # Build artifacts
+  artifacts:
+    sbom:
+      path: sbom.json
+      format: cyclonedx  # cyclonedx | spdx
+    signing:
+      enabled: true
+      method: sigstore
+    provenance:
+      path: .attestations/
+      format: slsa
+
+  # Dependency management
+  dependencies:
+    lockfile: uv.lock
+    manifest: pyproject.toml
+    # docs: DEPENDENCIES.md
+
+  # CI/CD configuration
+  ci:
+    provider: github
+    workflows:
+      - .github/workflows/ci.yml
+      - .github/workflows/release.yml
+    dependency_scanning: .github/dependabot.yml
+    security_scanning:
+      - .github/workflows/codeql.yml
+    testing:
+      - .github/workflows/ci.yml
+    code_quality:
+      - .github/workflows/ci.yml
