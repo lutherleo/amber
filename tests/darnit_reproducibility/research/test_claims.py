@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from darnit_reproducibility.research.claims import (
     INCONCLUSIVE,
     NOT_REPRODUCED,

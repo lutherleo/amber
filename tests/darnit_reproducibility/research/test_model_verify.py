@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from darnit_reproducibility.research import model, verify
 from darnit_reproducibility.research.claims import parse_claim
 from darnit_reproducibility.research.graph import ResearchGraph

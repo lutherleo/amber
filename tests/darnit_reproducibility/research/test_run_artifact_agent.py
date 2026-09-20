@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from darnit_reproducibility.research import artifact as artifact_mod
 from darnit_reproducibility.research import model
 from darnit_reproducibility.research import run as run_mod

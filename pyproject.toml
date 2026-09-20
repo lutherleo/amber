@@ -155,6 +155,10 @@ exclude = [
     ".eggs",
     # Intentionally broken syntax fixture for FR-019 (parser error recovery test)
     "tests/darnit_baseline/threat_model/fixtures/red_herrings/broken_syntax.py",
+    # Vendored standalone subproject (orion): its own package, Python 3.12 target,
+    # and its own tooling. Its taint-summary tests are byte-for-byte fragile, so we
+    # do not reformat it under this repo's root lint config.
+    "graphrag",
 ]
 
 [tool.ruff.lint]
