@@ -1,0 +1,9 @@
+repo,config,n,verify_seconds,per_push,ok
+git,branch,1,1.793283,1.793283,True
+git,branch,5,4.305317,0.861063,True
+git,branch,10,7.135899,0.71359,True
+git,branch,25,15.89226,0.63569,True
+git,branch_file,26,17.754275,0.682857,True
+git,branch_file,30,23.256054,0.775202,True
+git,branch_file,35,33.55523,0.958721,True
+git,branch_file,50,48.279146,0.965583,True

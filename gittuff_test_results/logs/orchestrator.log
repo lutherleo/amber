@@ -1,0 +1,73 @@
+image amber-gittuf:latest present
+
+==========================================================================
+capture run-A (witness, in amber-gittuf:latest)
+==========================================================================
+gittuf='gittuf version devel' git='git version 2.39.5' repos=['git'] pushes=[1, 5, 10, 25] depth=1000
+[git] copy from cache
+[git:branch] n=1 verify=1.7933s ok=True
+[git:branch] n=5 verify=4.3053s ok=True
+[git:branch] n=10 verify=7.1359s ok=True
+[git:branch] n=25 verify=15.8923s ok=True
+[git:branch_file] n=26 verify=17.7543s ok=True
+[git:branch_file] n=30 verify=23.2561s ok=True
+[git:branch_file] n=35 verify=33.5552s ok=True
+[git:branch_file] n=50 verify=48.2791s ok=True
+AMBER_METRIC verify_seconds=0.965583
+AMBER_METRIC storage_overhead_pct=0.0296
+gittuf benchmark complete.
+/work/bundle.json
+
+==========================================================================
+capture run-B (witness, in amber-gittuf:latest)
+==========================================================================
+gittuf='gittuf version devel' git='git version 2.39.5' repos=['git'] pushes=[1, 5, 10, 25] depth=1000
+[git] copy from cache
+[git:branch] n=1 verify=1.3898s ok=True
+[git:branch] n=5 verify=3.8568s ok=True
+[git:branch] n=10 verify=7.5469s ok=True
+[git:branch] n=25 verify=14.5196s ok=True
+[git:branch_file] n=26 verify=16.0112s ok=True
+[git:branch_file] n=30 verify=19.8263s ok=True
+[git:branch_file] n=35 verify=24.4535s ok=True
+[git:branch_file] n=50 verify=45.3362s ok=True
+AMBER_METRIC verify_seconds=0.906724
+AMBER_METRIC storage_overhead_pct=0.025
+gittuf benchmark complete.
+/work/bundle.json
+run-A metrics: {'verify_seconds': 0.965583, 'storage_overhead_pct': 0.0296}
+run-B metrics: {'verify_seconds': 0.906724, 'storage_overhead_pct': 0.025}
+
+==========================================================================
+amber research: begin + ingest + join
+==========================================================================
+  run-A: code_ref=internal/cmd/verifyref/verifyref.go methods=4
+  run-B: code_ref=internal/cmd/verifyref/verifyref.go methods=4
+
+==========================================================================
+amber research: verify claims (paper vs run-A)
+==========================================================================
+  claim verify_seconds       NOT_REPRODUCED  measured 0.965583 <= 0.59
+  claim storage_overhead_pct REPRODUCED      measured 0.0296 <= 4
+  claim exit_code            REPRODUCED      measured 0 <= 0
+  claim output_count         REPRODUCED      measured 1 >= 1
+
+==========================================================================
+amber research: verify reproducibility (run-A vs run-B)
+==========================================================================
+  run-A vs run-B -> BIT_FOR_BIT
+
+==========================================================================
+amber research: ask (deterministic) + artifact
+==========================================================================
+Paper: Rethinking Trust in Forge-Based Git Security (gittuf) — 4 claim(s)
+Projects: gittuf
+Runs: 2
+  - run-A (py 3.12.15, exit 0): result.json; code: 4 methods
+  - run-B (py 3.12.15, exit 0): result.json; code: 4 methods
+
+Inconsistencies:
+  ! claim `verify_seconds` NOT_REPRODUCED: measured 0.965583 <= 0.59
+packed artifact -> C:\Users\h\Documents\amber\gittuff_test_results\gittuf-artifact.tar.gz
+
+summary -> C:\Users\h\Documents\amber\gittuff_test_results\summary.json

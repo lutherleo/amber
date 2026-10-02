@@ -1,0 +1,73 @@
+{
+  "generated_at": "2026-10-02T10:08:33.658761+00:00",
+  "image": "amber-gittuf:latest",
+  "bench_env": {
+    "GITTUF_BENCH_REPOS": "git",
+    "GITTUF_BENCH_PUSHES": "1 5 10 25",
+    "GITTUF_BENCH_DEPTH": "1000",
+    "GITTUF_BENCH_CACHE": "/cache",
+    "GITTUF_BENCH_SCRATCH": "/bench",
+    "GITTUF_BENCH_METRICS": "/metrics"
+  },
+  "code_graph": {
+    "path": "C:\\Users\\h\\Documents\\amber\\gittuff_test_results\\gittuf-orion-graph.json",
+    "exists": true,
+    "join": {
+      "resolved": [
+        "internal/cmd/verifyref/verifyref.go",
+        "internal/cmd/verifyref/verifyref.go"
+      ],
+      "unresolved": [],
+      "code_scan_id": "gittuf"
+    }
+  },
+  "run_A": {
+    "metrics": {
+      "verify_seconds": 0.965583,
+      "storage_overhead_pct": 0.0296
+    },
+    "bundle": "C:\\Users\\h\\Documents\\amber\\gittuff_test_results\\runs\\run-A\\bundle.json"
+  },
+  "run_B": {
+    "metrics": {
+      "verify_seconds": 0.906724,
+      "storage_overhead_pct": 0.025
+    },
+    "bundle": "C:\\Users\\h\\Documents\\amber\\gittuff_test_results\\runs\\run-B\\bundle.json"
+  },
+  "claims": [
+    {
+      "metric": "verify_seconds",
+      "comparator": "<=",
+      "value": 0.59,
+      "level": "NOT_REPRODUCED",
+      "detail": "measured 0.965583 <= 0.59",
+      "verdict_uid": "4d8e0ede71538b6bbb9b158d3a5d839faf0504dc"
+    },
+    {
+      "metric": "storage_overhead_pct",
+      "comparator": "<=",
+      "value": 4.0,
+      "level": "REPRODUCED",
+      "detail": "measured 0.0296 <= 4",
+      "verdict_uid": "63bec35547a05a61fabe506be5497491d3f3b22f"
+    },
+    {
+      "metric": "exit_code",
+      "comparator": "<=",
+      "value": 0.0,
+      "level": "REPRODUCED",
+      "detail": "measured 0 <= 0",
+      "verdict_uid": "8a7ccd1516115f70c9309174245d7c9b72a6511d"
+    },
+    {
+      "metric": "output_count",
+      "comparator": ">=",
+      "value": 1.0,
+      "level": "REPRODUCED",
+      "detail": "measured 1 >= 1",
+      "verdict_uid": "28d1e9a8dd7e6ef6072fb9e2461233a9ce07fed3"
+    }
+  ],
+  "reproducibility": "BIT_FOR_BIT"
+}

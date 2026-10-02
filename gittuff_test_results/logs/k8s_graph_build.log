@@ -1,0 +1,5 @@
+[orion] build repo=/src scan_id=kubernetes language=golang neo4j=bolt://orion-neo4j:7687 joern=/joern/joern-cli
+[orion] build done, scan_id=kubernetes
+[orion] wrote /out/kubernetes-orion-graph.json (122677 nodes, 229510 edges)
+[orion] nodes_by_label: {'CpgCall': 91112, 'CpgReturn': 9895, 'CpgMethod': 9860, 'CpgParameter': 7765, 'EntryPoint': 2836, 'CpgFile': 626, 'CandidateFlow': 300, 'CpgModule': 176, 'CandidateFinding': 73, 'Dependency': 34}
+[orion] edges_by_type:  {'CONTAINS_CALL': 92513, 'RESOLVES_TO': 91818, 'FLOWS_TO': 35824, 'DEFINED_IN': 6519, 'ENTERS_AT': 2836}

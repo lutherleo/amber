@@ -43,13 +43,30 @@ def _require_docker() -> str:
     return docker
 
 
-def build_default_image(tag: str, build_dir: str | Path) -> str:
-    """Write the default Dockerfile and build the image. Returns the image tag."""
+def build_default_image(
+    tag: str,
+    build_dir: str | Path,
+    *,
+    dockerfile: str | None = None,
+    build_args: dict[str, str] | None = None,
+) -> str:
+    """Write a Dockerfile into ``build_dir`` and build the image. Returns the image tag.
+
+    ``dockerfile`` overrides :data:`DEFAULT_DOCKERFILE` (e.g. a project that needs a
+    language toolchain or a vendored ``witness`` binary ``COPY``'d from the build
+    context instead of downloaded). ``build_args`` are passed as ``--build-arg``.
+    When ``dockerfile`` is given, the caller is responsible for placing any files it
+    ``COPY``s into ``build_dir`` first.
+    """
     docker = _require_docker()
     build_dir = Path(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
-    (build_dir / "Dockerfile").write_text(DEFAULT_DOCKERFILE, encoding="utf-8")
-    subprocess.run([docker, "build", "-t", tag, str(build_dir)], check=True)
+    (build_dir / "Dockerfile").write_text(dockerfile or DEFAULT_DOCKERFILE, encoding="utf-8")
+    argv = [docker, "build", "-t", tag]
+    for k, v in (build_args or {}).items():
+        argv += ["--build-arg", f"{k}={v}"]
+    argv += [str(build_dir)]
+    subprocess.run(argv, check=True)
     return tag
 
 
@@ -60,21 +77,32 @@ def run_capture_in_container(
     *,
     step: str = "run",
     bundle_name: str = "bundle.json",
+    capture_args: list[str] | None = None,
+    docker_args: list[str] | None = None,
 ) -> Path:
     """Run ``amber capture -- <experiment_cmd>`` inside the project container.
 
     The workspace is bind-mounted at ``/work``; the signed bundle lands there. The
     container's run-model is exactly the amber CLI, so host and container behave the
     same. Returns the host path to the produced bundle.
+
+    ``capture_args`` are extra flags for ``amber capture`` (e.g. ``["--no-ebpf"]`` so
+    the capture does not need a privileged container). ``docker_args`` are extra
+    ``docker run`` flags (e.g. extra ``-v`` mounts or ``--network``).
     """
     docker = _require_docker()
     ws = Path(workspace).resolve()
     ws.mkdir(parents=True, exist_ok=True)
+    # as_posix() so a Windows source (C:\...) is written C:/... — the form Docker
+    # Desktop accepts in a -v spec regardless of host shell.
     argv = [
         docker, "run", "--rm",
-        "-v", f"{ws}:/work",
+        "-v", f"{ws.as_posix()}:/work",
+        *(docker_args or []),
         image,
-        "capture", "--step", step, "-o", f"/work/{bundle_name}", "--",
+        "capture", "--step", step, "-o", f"/work/{bundle_name}",
+        *(capture_args or []),
+        "--",
         *experiment_cmd,
     ]
     subprocess.run(argv, check=True)

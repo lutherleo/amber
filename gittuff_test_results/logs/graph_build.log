@@ -1,0 +1,5 @@
+[orion] build repo=/src scan_id=gittuf language=golang neo4j=bolt://orion-neo4j:7687 joern=/joern/joern-cli
+[orion] build done, scan_id=gittuf
+[orion] wrote /out/gittuf-orion-graph.json (85545 nodes, 195509 edges)
+[orion] nodes_by_label: {'CpgCall': 70383, 'CpgMethod': 4949, 'CpgReturn': 4949, 'CpgParameter': 3102, 'EntryPoint': 803, 'CpgFile': 556, 'CandidateFlow': 300, 'Dependency': 218, 'CpgModule': 200, 'CandidateFinding': 85}
+[orion] edges_by_type:  {'CONTAINS_CALL': 70764, 'RESOLVES_TO': 70745, 'FLOWS_TO': 49596, 'DEFINED_IN': 3601, 'ENTERS_AT': 803}
